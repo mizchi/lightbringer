@@ -833,8 +833,13 @@ function logSummary(report: PerfReport): void {
     lines.push(
       `  ${s.name.padEnd(26)} ${String(s.durationMs).padStart(7)}ms${s.capped ? " (capped)" : ""}`,
     );
+    // when the network is busy for ~the whole span, busyMs reflects the wait
+    // window (continuous loading: ads, polling), not a discrete load cost.
+    const saturated =
+      s.durationMs > 50 && s.network.busyMs / s.durationMs > 0.9;
     lines.push(
-      `      net   busy=${s.network.busyMs}ms  ${s.network.requestCount}reqs  ${s.network.waves}waves  ${s.network.encodedKB}KB`,
+      `      net   busy=${s.network.busyMs}ms  ${s.network.requestCount}reqs  ${s.network.waves}waves  ${s.network.encodedKB}KB` +
+        (saturated ? "  (net-saturated: busyMs ≈ window)" : ""),
     );
     lines.push(
       `      cpu   block=${s.cpu.blockingMs}ms  longtasks=${s.cpu.longTaskCount}` +

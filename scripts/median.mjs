@@ -177,8 +177,12 @@ function printSummary(agg) {
   );
   for (const s of agg.spans) {
     lines.push(`  ${s.name}  ${fmt(s.durationMs)}ms`);
+    const saturated =
+      s.durationMs.median > 50 &&
+      s.network.busyMs.median / s.durationMs.median > 0.9;
     lines.push(
-      `      net    busy=${fmt(s.network.busyMs)}ms  reqs=${fmt(s.network.requestCount)}  waves=${fmt(s.network.waves)}  ${fmt(s.network.encodedKB)}KB`,
+      `      net    busy=${fmt(s.network.busyMs)}ms  reqs=${fmt(s.network.requestCount)}  waves=${fmt(s.network.waves)}  ${fmt(s.network.encodedKB)}KB` +
+        (saturated ? "  (net-saturated: busyMs ≈ window)" : ""),
     );
     lines.push(
       `      cpu    block=${fmt(s.cpu.blockingMs)}ms  maxTask=${fmt(s.cpu.maxLongTaskMs)}ms`,

@@ -245,6 +245,11 @@ Things that bite, learned from the accuracy probe:
 - The drilldown's **self** time comes from the V8 CPU profiler (sampling), so it
   is approximate at very short durations; the **total** view and event-name view
   complement it.
+- **`(net-saturated: busyMs ≈ window)`** is shown when the network is busy for
+  ~the whole span (continuous loading: ads, polling, long-polling). There, `busyMs`
+  and `durationMs` reflect the wait window you chose, not a discrete load cost —
+  read the discrete metrics (`cpu.block` / `script` / recalc counts / vitals) and
+  `waves` / `requestCount` instead.
 
 ## Bench fixtures
 
