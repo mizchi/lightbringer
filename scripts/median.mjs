@@ -144,6 +144,8 @@ const STAT_OF = {
   busyMs: (s) => s.network.busyMs,
   layoutCount: (s) => s.render.layoutCount,
   nodes: (s) => s.render.nodes,
+  paintMs: (s) => s.render.paintMs, // only present with PERF_TRACE
+  paintCount: (s) => s.render.paintCount,
 };
 
 /**
@@ -159,6 +161,7 @@ function checkBudget(agg) {
     for (const [k, limit] of Object.entries(s.budget)) {
       if (limit == null || !STAT_OF[k]) continue;
       const st = STAT_OF[k](s);
+      if (!st) continue; // e.g. paint metrics absent without PERF_TRACE
       if (st.median > limit) {
         violations.push(`${agg.slug} / ${s.name}.${k} median=${st.median} > budget ${limit}`);
       } else if (st.noisy && st.p75 > limit) {

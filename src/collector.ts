@@ -139,6 +139,9 @@ export interface Budget {
   busyMs?: number;
   layoutCount?: number;
   nodes?: number;
+  /** paint metrics are only present with PERF_TRACE=1; the gate is a no-op otherwise */
+  paintMs?: number;
+  paintCount?: number;
 }
 
 export interface SpanReport {
@@ -167,6 +170,8 @@ const BUDGET_METRIC: Record<keyof Budget, (s: SpanReport) => number> = {
   busyMs: (s) => s.network.busyMs,
   layoutCount: (s) => s.render.layoutCount,
   nodes: (s) => s.render.nodes,
+  paintMs: (s) => s.render.paintMs ?? 0,
+  paintCount: (s) => s.render.paintCount ?? 0,
 };
 
 /** Budget violations on a single run (actual > budget). */

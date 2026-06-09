@@ -199,7 +199,8 @@ Two gates, same declared budget:
 Either way, violations are also printed in the per-run summary (`! budget: ...`).
 
 Span budget fields: `durationMs`, `scriptMs`, `blockingMs`, `encodedKB`,
-`requestCount`, `waves`, `busyMs`, `layoutCount`, `nodes`. For page-global
+`requestCount`, `waves`, `busyMs`, `layoutCount`, `nodes`, `paintCount` /
+`paintMs` (PERF_TRACE only). For page-global
 web-vitals, declare a separate budget once per test:
 
 ```ts
@@ -288,6 +289,7 @@ regression fixture for the tool. `?fixed` (or `BENCH_FIXED=1`) toggles the fix.
 | nplus1 | list, then one request per item | `network.requestCount` / `waves` | 6 / 6 → 2 / 2 | batch endpoint |
 | chain | each request depends on the previous result | `network.waves` | 4 waves / 608 ms → 1 / 156 ms | combined endpoint |
 | huge-dom | rendering 30k list items | `render.nodes` | ~120k nodes / layout 100 ms → ~400 / fast | windowing / pagination |
+| paint | animating box-shadow every frame (no layout) | `render.paintCount` (PERF_TRACE) | 196 paints → 4 | animate `transform` (compositor-only) |
 
 Notes worth internalizing:
 

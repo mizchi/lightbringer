@@ -4,6 +4,7 @@ import {
   useEffect,
   useLayoutEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 
@@ -224,6 +225,41 @@ function HugeDom({ fixed }: { fixed: boolean }) {
   );
 }
 
+// Scenario 9: paint-bound animation. slow animates box-shadow on a big element
+// every frame (repaints a large area, no layout). fixed animates transform
+// (compositor-only, no paint). Lights up render.paintCount / paintMs (PERF_TRACE).
+function Paint({ fixed }: { fixed: boolean }) {
+  const [status, setStatus] = useState("idle");
+  const ref = useRef<HTMLDivElement>(null);
+  const run = () => {
+    setStatus("running");
+    const el = ref.current;
+    if (!el) return;
+    const start = performance.now();
+    const step = () => {
+      const t = performance.now() - start;
+      if (fixed) {
+        el.style.transform = `translateX(${(t / 8) % 200}px)`; // composited, no paint
+      } else {
+        el.style.boxShadow = `0 0 ${(t / 8) % 120}px 20px rgba(0,0,0,0.6)`; // repaints
+      }
+      if (t < 800) requestAnimationFrame(step);
+      else setStatus("done");
+    };
+    requestAnimationFrame(step);
+  };
+  return (
+    <main>
+      <h1>paint {fixed ? "(fixed)" : "(slow)"}</h1>
+      <button id="run" type="button" onClick={run}>
+        animate
+      </button>
+      <div id="status">{status}</div>
+      <div ref={ref} style={{ width: 600, height: 600, background: "#88f" }} />
+    </main>
+  );
+}
+
 // Scenario 8: layout shift (CLS). A banner is inserted at the top ~400ms after
 // load, pushing content down. Fix: reserve the space up front so nothing shifts.
 // Lights up vitals.CLS (visual stability — orthogonal to CPU/network/render).
@@ -350,6 +386,8 @@ export function App() {
       return <HugeDom fixed={fixed} />;
     case "cls":
       return <Cls fixed={fixed} />;
+    case "paint":
+      return <Paint fixed={fixed} />;
     default:
       return <Rerender fixed={fixed} />;
   }
