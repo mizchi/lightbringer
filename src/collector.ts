@@ -45,6 +45,12 @@ const PERF_OUT_DIR = path.resolve(process.env.PERF_OUT_DIR ?? "perf-results");
 /** With PERF_TRACE=1, save a Chrome trace (openable in DevTools / Perfetto). */
 const TRACE_ENABLED = process.env.PERF_TRACE === "1";
 
+/** PERF_CPU=N throttles the CPU N times (mid-tier device emulation). 1 = off. */
+const CPU_RATE = Number(process.env.PERF_CPU ?? "1");
+
+/** Max time to wait for settle before marking a span capped (ms). */
+const SETTLE_TIMEOUT_MS = Number(process.env.PERF_SETTLE_TIMEOUT ?? "5000");
+
 // ---------------------------------------------------------------------------
 // Report types (the contract layer)
 // ---------------------------------------------------------------------------
@@ -105,6 +111,8 @@ export interface SpanReport {
   name: string;
   /** measured time from action start until settle (ms) */
   durationMs: number;
+  /** true if settle hit PERF_SETTLE_TIMEOUT (durationMs is then unreliable) */
+  capped: boolean;
   network: SpanNetwork;
   cpu: SpanCpu;
   render: SpanRender;
@@ -270,6 +278,7 @@ interface RawSpan {
   name: string;
   startEpochMs: number;
   endEpochMs: number;
+  capped: boolean;
   render: SpanRender;
   /** span window in trace clock (monotonic μs) for correlation / drilldown */
   traceStartUs: number;
@@ -313,18 +322,31 @@ export class PerfController {
     const startEpochMs = await this.now();
     const before = await this.metrics();
     await action();
-    await (opts.settle ?? this.settle)(this.page);
+    const capped = await this.runSettle(opts.settle ?? this.settle);
     const endEpochMs = await this.now();
     const after = await this.metrics();
     this.spans.push({
       name,
       startEpochMs,
       endEpochMs,
+      capped,
       render: diffMetrics(before, after),
       // getMetrics Timestamp (monotonic seconds) shares the clock with trace ts (μs).
       traceStartUs: (before.Timestamp ?? 0) * 1e6,
       traceEndUs: (after.Timestamp ?? 0) * 1e6,
     });
+  }
+
+  /** Run settle but give up after SETTLE_TIMEOUT_MS. Returns true if it capped. */
+  private async runSettle(settle: Settle): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(true), SETTLE_TIMEOUT_MS);
+    });
+    const done = settle(this.page).then(() => false);
+    const capped = await Promise.race([done, timeout]);
+    if (timer) clearTimeout(timer);
+    return capped;
   }
 
   private now(): Promise<number> {
@@ -669,6 +691,7 @@ function buildReport(
     return {
       name: s.name,
       durationMs: round(s.endEpochMs - s.startEpochMs),
+      capped: s.capped,
       network: buildSpanNetwork(s, reqs),
       cpu: buildSpanCpu(s, longTasks, loaf),
       render,
@@ -717,7 +740,7 @@ function logSummary(report: PerfReport): void {
   );
   for (const s of report.spans) {
     lines.push(
-      `  ${s.name.padEnd(26)} ${String(s.durationMs).padStart(7)}ms`,
+      `  ${s.name.padEnd(26)} ${String(s.durationMs).padStart(7)}ms${s.capped ? " (capped)" : ""}`,
     );
     lines.push(
       `      net   busy=${s.network.busyMs}ms  ${s.network.requestCount}reqs  ${s.network.waves}waves  ${s.network.encodedKB}KB`,
@@ -769,6 +792,11 @@ export const test = base.extend<{ perf: PerfController }>({
 
     const client = await page.context().newCDPSession(page);
     await client.send("Performance.enable");
+    // PERF_CPU=N slows the CPU N times (mid-tier device emulation). GL/GPU is not
+    // throttled, so this surfaces JS / render bottlenecks hidden on a fast machine.
+    if (CPU_RATE > 1) {
+      await client.send("Emulation.setCPUThrottlingRate", { rate: CPU_RATE });
+    }
     const finishNetwork = await startNetworkCapture(client);
     const finishTrace = TRACE_ENABLED ? await startTrace(client) : undefined;
 

@@ -74,9 +74,18 @@ covers "until the operation is done".
 ```sh
 pnpm exec playwright test                       # measure
 PERF_TRACE=1 pnpm exec playwright test          # also save a Chrome trace
+PERF_CPU=4 pnpm exec playwright test            # throttle CPU 4x (mid-tier device)
 pnpm exec playwright test --repeat-each=5        # multiple runs for median
 node node_modules/lightbringer/scripts/median.mjs
 ```
+
+### CPU throttling (find bottlenecks hidden by a fast machine)
+
+A fast dev machine makes app JS look free. `PERF_CPU=N` slows the CPU N times via
+CDP (`Emulation.setCPUThrottlingRate`), so React re-render storms and heavy
+synchronous work surface as long tasks. GPU/GL is **not** throttled, so this
+isolates the JS/main-thread cost. Note that the page's own fixed `waitFor`
+timeouts may need raising under heavy throttle.
 
 ### Median (kill the noise)
 
@@ -131,6 +140,10 @@ await perf.measure("pan-map", async () => { /* ... */ }, {
     page.evaluate(() => new Promise<void>((r) => myMap.once("idle", r))),
 });
 ```
+
+Settle is bounded by `PERF_SETTLE_TIMEOUT` (default 5000ms). If it times out the
+span is flagged `capped` and its `durationMs` should not be trusted (read the
+network / CPU / render breakdown instead).
 
 ## Caveats
 
