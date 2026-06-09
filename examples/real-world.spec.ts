@@ -3,9 +3,15 @@ import { test } from "../src/index";
 // Observation-only specs against noisy, ad-heavy production sites. Unlike the
 // synthetic fixtures these have huge request counts, third-party scripts, and
 // run-to-run variance — a stress test for the harness (use --repeat-each + median).
+// Diverse "slow site" patterns: ad/tracker-heavy news, JP widget portals, media
+// SPAs with heavy hydration. Each stresses a different cause of slowness.
 const sites = [
-  { name: "nicovideo", url: "https://www.nicovideo.jp/" },
-  { name: "goal", url: "https://www.goal.com/en" },
+  { name: "nicovideo", url: "https://www.nicovideo.jp/" }, // video portal, ad + thumbnail heavy
+  { name: "goal", url: "https://www.goal.com/en" }, // sports news, ad/tracker heavy
+  { name: "yahoo-jp", url: "https://www.yahoo.co.jp/" }, // JP portal, many widgets + ads
+  { name: "cnn", url: "https://edition.cnn.com/" }, // US news, ad + video heavy
+  { name: "youtube", url: "https://www.youtube.com/" }, // media SPA, heavy hydration
+  { name: "weather", url: "https://weather.com/" }, // very JS / ad heavy
 ];
 
 for (const site of sites) {
