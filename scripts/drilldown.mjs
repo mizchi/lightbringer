@@ -103,6 +103,53 @@ const fnRanked = [...byFn.entries()]
   .sort((a, b) => b.totalMs - a.totalMs)
   .slice(0, topN);
 
+// --- self time from the V8 CPU profiler (disabled-by-default-v8.cpu_profiler) ---
+// ProfileChunk events carry incrementally-defined call-tree nodes plus a sample
+// stream (node id per sample) and timeDeltas (μs between samples). Self time of a
+// node = sum of timeDeltas for samples landing on it. Unlike the function totals
+// above (which include children), this is each frame's own cost.
+const nodeFrame = new Map(); // nodeId -> "functionName  url:line"
+const selfByFrame = new Map(); // frame -> selfMs
+let profileStartUs = null;
+let cursorUs = null;
+
+for (const e of events) {
+  if (e.name === "Profile" && e.args?.data?.startTime != null) {
+    profileStartUs = e.args.data.startTime;
+    cursorUs = profileStartUs;
+  }
+  if (e.name !== "ProfileChunk") continue;
+  const cp = e.args?.data?.cpuProfile;
+  if (!cp) continue;
+  for (const n of cp.nodes ?? []) {
+    const cf = n.callFrame ?? {};
+    const fn = cf.functionName || "(anonymous)";
+    // skip V8 synthetic frames so the ranking shows real JS, not idle/GC time
+    if (["(idle)", "(program)", "(garbage collector)", "(root)"].includes(fn)) {
+      nodeFrame.set(n.id, null);
+      continue;
+    }
+    const loc = cf.url ? `${shorten(cf.url)}:${(cf.lineNumber ?? 0) + 1}` : "";
+    nodeFrame.set(n.id, `${fn}  ${loc}`);
+  }
+  const samples = cp.samples ?? [];
+  const deltas = e.args.data.timeDeltas ?? cp.timeDeltas ?? [];
+  if (cursorUs == null) cursorUs = profileStartUs ?? startUs;
+  for (let i = 0; i < samples.length; i++) {
+    const dt = deltas[i] ?? 0;
+    cursorUs += dt;
+    if (cursorUs < startUs || cursorUs > endUs) continue;
+    const frame = nodeFrame.get(samples[i]);
+    if (!frame) continue;
+    selfByFrame.set(frame, (selfByFrame.get(frame) ?? 0) + dt / 1000);
+  }
+}
+const selfRanked = [...selfByFrame.entries()]
+  .map(([key, ms]) => ({ key, selfMs: round(ms) }))
+  .filter((r) => r.selfMs > 0)
+  .sort((a, b) => b.selfMs - a.selfMs)
+  .slice(0, topN);
+
 console.log(`\n[drilldown] ${slug}`);
 console.log(
   `span "${spanName}"  dur=${span.durationMs}ms  cpu.block=${span.cpu.blockingMs}ms  render.script=${span.render.scriptMs}ms`,
@@ -123,4 +170,14 @@ if (fnRanked.length === 0) {
 }
 for (const r of fnRanked) {
   console.log(`    ${String(r.totalMs).padStart(8)}ms x${r.count}  ${r.key}`);
+}
+
+console.log(`\n  function SELF time top ${topN} (own cost, from CPU profiler):`);
+if (selfRanked.length === 0) {
+  console.log(
+    "    no CPU profiler samples in window (was PERF_TRACE=1 with v8.cpu_profiler?)",
+  );
+}
+for (const r of selfRanked) {
+  console.log(`    ${String(r.selfMs).padStart(8)}ms  ${r.key}`);
 }

@@ -109,8 +109,11 @@ PERF_TRACE=1 pnpm exec playwright test
 lightbringer-drilldown <slug> <spanName>
 ```
 
-It prints an event-name breakdown (Layout / Paint / FunctionCall / WebGL /
-`v8.parseOnBackground` / …) and a function-level breakdown (`functionName @ url:line`).
+It prints three views: an event-name breakdown (Layout / Paint / FunctionCall /
+WebGL / `v8.parseOnBackground` / …), a function **total** time (includes children),
+and a function **self** time computed from the V8 CPU profiler — the latter is what
+pinpoints the actual hot function (e.g. a specific React render), with V8 synthetic
+frames like `(idle)` / `(program)` filtered out.
 
 ### App spans (`withSpan`)
 
@@ -159,10 +162,13 @@ network / CPU / render breakdown instead).
 - **`cpu.block` is the sum of long tasks.** Very short synchronous work, or work
   that doesn't cross a task boundary, may not register as a long task (it shows
   in LoAF instead). Use the trace for fine-grained attribution.
-- **Function-level drilldown counts call-boundary time** (`FunctionCall` /
-  `EvaluateScript`), including children and time spent in native/GL code. For
-  exact self time, add the `disabled-by-default-v8.cpu_profiler` category and
-  parse the CPU profile.
+- **`logSummary` warns automatically** when the WebGL renderer is SwiftShader
+  (software GL → fake GPU numbers) or when uncaught page errors occurred during
+  the run (a broken / stale build makes the measurement invalid). The report
+  carries `glRenderer` and `pageErrors`.
+- The drilldown's **self** time comes from the V8 CPU profiler (sampling), so it
+  is approximate at very short durations; the **total** view and event-name view
+  complement it.
 
 ## License
 

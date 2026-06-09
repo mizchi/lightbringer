@@ -146,6 +146,10 @@ export interface PerfReport {
   appSpans: AppSpanReport[];
   /** scenario-wide network total */
   network: NetworkReport;
+  /** WebGL renderer string; "SwiftShader" means software GL (GPU numbers are fake) */
+  glRenderer?: string;
+  /** uncaught page errors during measurement; non-empty means results are suspect */
+  pageErrors?: string[];
   tracePath?: string;
 }
 
@@ -445,6 +449,7 @@ async function startTrace(
       "latencyInfo",
       "v8.execute",
       "gpu",
+      "disabled-by-default-v8.cpu_profiler",
     ].join(","),
   });
   return async () => {
@@ -777,6 +782,19 @@ function logSummary(report: PerfReport): void {
   lines.push(
     `  total network ${report.network.totalRequests} reqs / ${report.network.totalEncodedKB}KB`,
   );
+  if (report.glRenderer && /swiftshader/i.test(report.glRenderer)) {
+    lines.push(
+      "  ! software GL (SwiftShader): GPU / render numbers are NOT real hardware. Use PERF_GPU=1.",
+    );
+  }
+  if (report.pageErrors && report.pageErrors.length > 0) {
+    lines.push(
+      `  ! ${report.pageErrors.length} page error(s) during measurement — results may be invalid:`,
+    );
+    for (const e of report.pageErrors.slice(0, 3)) {
+      lines.push(`      ${e.split("\n")[0]}`);
+    }
+  }
   // eslint-disable-next-line no-console
   console.log(lines.join("\n"));
 }
@@ -789,6 +807,11 @@ export const test = base.extend<{ perf: PerfController }>({
   perf: async ({ page }, use, testInfo) => {
     await page.addInitScript({ content: WEB_VITALS_IIFE });
     await page.addInitScript(browserCollector);
+
+    // Capture uncaught errors: a broken / stale build (e.g. a reused dev server
+    // serving an old bundle) typically throws, which makes the measurement invalid.
+    const pageErrors: string[] = [];
+    page.on("pageerror", (e) => pageErrors.push(String(e)));
 
     const client = await page.context().newCDPSession(page);
     await client.send("Performance.enable");
@@ -809,6 +832,21 @@ export const test = base.extend<{ perf: PerfController }>({
     const timeOrigin = await page
       .evaluate(() => performance.timeOrigin)
       .catch(() => 0);
+    // Detect software GL (SwiftShader): its GPU/render numbers are not real hardware.
+    const glRenderer = await page
+      .evaluate(() => {
+        try {
+          const gl = document.createElement("canvas").getContext("webgl");
+          if (!gl) return null;
+          const ext = gl.getExtension("WEBGL_debug_renderer_info");
+          return ext
+            ? (gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) as string)
+            : (gl.getParameter(gl.RENDERER) as string);
+        } catch {
+          return null;
+        }
+      })
+      .catch(() => null);
     const url = page.url();
     const reqs = finishNetwork();
     // finish the trace before buildReport so Paint/GPU can correlate to spans
@@ -831,6 +869,9 @@ export const test = base.extend<{ perf: PerfController }>({
       reqs,
       traceEvents,
     );
+
+    if (glRenderer) report.glRenderer = glRenderer;
+    if (pageErrors.length) report.pageErrors = pageErrors;
 
     if (traceEvents) {
       const tracePath = path.join(PERF_OUT_DIR, `${slug}.${runTag}.trace.json`);
