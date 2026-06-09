@@ -245,9 +245,11 @@ toggles the fix:
 | rerender | unrelated heavy list re-renders on click | `render.scriptMs` | 129 → 1.8 ms | `React.memo` |
 | reflow | write-then-read geometry in a loop (forced sync layout) | `render.layoutCount` / `layoutMs` | 2000 / 335 ms → 1 / 1.6 ms | batch reads then writes |
 | input | heavy sync work per keystroke | `vitals.INP` | 64 → 8 ms | `useDeferredValue` |
+| network | four requests awaited one-by-one | `network.waves` / `busyMs` | 4 waves / 808 ms → 1 / 203 ms | `Promise.all` |
 
 `reflow` is the instructive one: its `scriptMs` is ~8 ms, so a CPU-only view
-misses it — the layout breakdown is what surfaces the 335 ms. The `rerender`
+misses it — the layout breakdown is what surfaces the 335 ms. `network` is the
+mirror image: zero CPU, the cost is entirely waterfall depth. The `rerender`
 drilldown's self time points straight at the app's own `expensiveValue` (with
 file:line), not a library.
 

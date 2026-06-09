@@ -114,6 +114,33 @@ function InputFilter({ fixed }: { fixed: boolean }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Scenario 4: serial request waterfall — fix by parallelizing. Lights up
+// network.waves / busyMs (no CPU cost involved).
+// ---------------------------------------------------------------------------
+function Network({ fixed }: { fixed: boolean }) {
+  const [status, setStatus] = useState("idle");
+  const load = async () => {
+    setStatus("loading");
+    const urls = [1, 2, 3, 4].map((id) => `/api/slow?ms=200&id=${id}`);
+    if (fixed) {
+      await Promise.all(urls.map((u) => fetch(u).then((r) => r.text())));
+    } else {
+      for (const u of urls) await fetch(u).then((r) => r.text());
+    }
+    setStatus("done");
+  };
+  return (
+    <main>
+      <h1>network {fixed ? "(fixed)" : "(slow)"}</h1>
+      <button id="load" type="button" onClick={load}>
+        load
+      </button>
+      <div id="status">{status}</div>
+    </main>
+  );
+}
+
 export function App() {
   const p = params();
   const fixed = p.has("fixed");
@@ -122,6 +149,8 @@ export function App() {
       return <Reflow fixed={fixed} />;
     case "input":
       return <InputFilter fixed={fixed} />;
+    case "network":
+      return <Network fixed={fixed} />;
     default:
       return <Rerender fixed={fixed} />;
   }

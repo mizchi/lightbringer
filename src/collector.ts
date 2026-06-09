@@ -132,6 +132,7 @@ export interface Budget {
   blockingMs?: number;
   encodedKB?: number;
   requestCount?: number;
+  waves?: number;
   layoutCount?: number;
 }
 
@@ -157,6 +158,7 @@ const BUDGET_METRIC: Record<keyof Budget, (s: SpanReport) => number> = {
   blockingMs: (s) => s.cpu.blockingMs,
   encodedKB: (s) => s.network.encodedKB,
   requestCount: (s) => s.network.requestCount,
+  waves: (s) => s.network.waves,
   layoutCount: (s) => s.render.layoutCount,
 };
 

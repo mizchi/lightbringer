@@ -117,6 +117,7 @@ const MEDIAN_OF = {
   blockingMs: (s) => s.cpu.blockingMs.median,
   encodedKB: (s) => s.network.encodedKB.median,
   requestCount: (s) => s.network.requestCount.median,
+  waves: (s) => s.network.waves.median,
   layoutCount: (s) => s.render.layoutCount.median,
 };
 
