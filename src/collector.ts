@@ -971,7 +971,13 @@ export const test = base.extend<{ perf: PerfController }>({
       : undefined;
 
     fs.mkdirSync(PERF_OUT_DIR, { recursive: true });
-    const slug = testInfo.title.replace(/[^\p{L}\p{N}_]+/gu, "_");
+    // Use the full title path (describe blocks + test title) so tests that share a
+    // title under different describes (e.g. one test body looped over many sites)
+    // don't collide into the same report / median bucket.
+    const slug = testInfo.titlePath
+      .filter(Boolean)
+      .join("_")
+      .replace(/[^\p{L}\p{N}_]+/gu, "_");
     // run index keeps files from colliding under --repeat-each=N.
     // The median script aggregates <slug>.run*.json.
     const runTag = `run${testInfo.repeatEachIndex}`;
