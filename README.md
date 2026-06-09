@@ -232,6 +232,30 @@ Things that bite, learned from the accuracy probe:
   is approximate at very short durations; the **total** view and event-name view
   complement it.
 
+## Bench fixtures
+
+`fixtures/app` is a tiny React app with three deliberate, fixable app-JS
+bottlenecks, served by Vite. The specs in `examples/{rerender,reflow,input}.spec.ts`
+measure each and double as regression fixtures for the tool itself. Each lights up
+a **different** metric (CPU / layout / interaction); `?fixed` (or `BENCH_FIXED=1`)
+toggles the fix:
+
+| scenario | bottleneck | metric | slow → fixed | fix |
+| --- | --- | --- | --- | --- |
+| rerender | unrelated heavy list re-renders on click | `render.scriptMs` | 129 → 1.8 ms | `React.memo` |
+| reflow | write-then-read geometry in a loop (forced sync layout) | `render.layoutCount` / `layoutMs` | 2000 / 335 ms → 1 / 1.6 ms | batch reads then writes |
+| input | heavy sync work per keystroke | `vitals.INP` | 64 → 8 ms | `useDeferredValue` |
+
+`reflow` is the instructive one: its `scriptMs` is ~8 ms, so a CPU-only view
+misses it — the layout breakdown is what surfaces the 335 ms. The `rerender`
+drilldown's self time points straight at the app's own `expensiveValue` (with
+file:line), not a library.
+
+```sh
+npx playwright test reflow.spec.ts                 # slow
+BENCH_FIXED=1 npx playwright test reflow.spec.ts    # fixed
+```
+
 ## License
 
 MIT

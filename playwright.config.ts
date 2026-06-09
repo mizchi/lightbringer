@@ -14,6 +14,15 @@ export default defineConfig({
   reporter: "line",
   use: {
     ...devices["Desktop Chrome"],
+    // bench specs use relative URLs against the fixture app; external-URL specs
+    // (example.com, react.dev) pass absolute URLs and ignore this.
+    baseURL: "http://localhost:5173",
     ...(perfGpu ? { launchOptions: { args: gpuArgs } } : {}),
+  },
+  // serves fixtures/app for the bench specs (rerender / reflow / input)
+  webServer: {
+    command: "pnpm exec vite",
+    url: "http://localhost:5173",
+    reuseExistingServer: !process.env.CI,
   },
 });

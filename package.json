@@ -45,9 +45,15 @@
   "devDependencies": {
     "@playwright/test": "^1.59.0",
     "@secretlint/secretlint-rule-preset-recommend": "^9.0.0",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.2",
     "oxlint": "^1.0.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
     "secretlint": "^9.0.0",
     "typescript": "^5.7.0",
+    "vite": "^8.0.16",
     "vitest": "^4.0.0"
   },
   "packageManager": "pnpm@10.16.0"
