@@ -114,6 +114,9 @@ export interface SpanRender {
   recalcStyleMs: number;
   layoutCount: number;
   layoutMs: number;
+  /** net DOM nodes added during the span (CDP Nodes delta) — the driver of huge-DOM
+   * style/layout cost. Not a memory metric; a render-cost cause. */
+  nodes: number;
   /** JS execution time in the span (ms, CDP metric; distinct from cpu.blockingMs) */
   scriptMs: number;
   paintCount?: number;
@@ -135,6 +138,7 @@ export interface Budget {
   waves?: number;
   busyMs?: number;
   layoutCount?: number;
+  nodes?: number;
 }
 
 export interface SpanReport {
@@ -162,6 +166,7 @@ const BUDGET_METRIC: Record<keyof Budget, (s: SpanReport) => number> = {
   waves: (s) => s.network.waves,
   busyMs: (s) => s.network.busyMs,
   layoutCount: (s) => s.render.layoutCount,
+  nodes: (s) => s.render.nodes,
 };
 
 /** Budget violations on a single run (actual > budget). */
@@ -384,6 +389,7 @@ function diffMetrics(
     recalcStyleMs: round(d("RecalcStyleDuration") * 1000),
     layoutCount: d("LayoutCount"),
     layoutMs: round(d("LayoutDuration") * 1000),
+    nodes: d("Nodes"),
     scriptMs: round(d("ScriptDuration") * 1000),
   };
 }
@@ -852,7 +858,7 @@ function logSummary(report: PerfReport): void {
         : "";
     lines.push(
       `      render style=${r.recalcStyleCount}/${r.recalcStyleMs}ms` +
-        `  layout=${r.layoutCount}/${r.layoutMs}ms  script=${r.scriptMs}ms${paint}`,
+        `  layout=${r.layoutCount}/${r.layoutMs}ms  nodes=${r.nodes}  script=${r.scriptMs}ms${paint}`,
     );
   }
   if (report.appSpans.length > 0) {

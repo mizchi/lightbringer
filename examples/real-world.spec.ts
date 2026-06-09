@@ -18,6 +18,10 @@ const sites = [
   { name: "nextjs", url: "https://nextjs.org/" }, // Next.js (React) hydration
   { name: "vercel-store", url: "https://demo.vercel.store/" }, // Next.js Commerce demo
   { name: "nuxt", url: "https://nuxt.com/" }, // Nuxt (Vue) hydration
+  // e-commerce: product grids + personalization + heavy tracking, often a large DOM.
+  { name: "rakuten", url: "https://www.rakuten.co.jp/" }, // JP EC portal, very heavy
+  { name: "allbirds", url: "https://www.allbirds.com/" }, // Shopify store
+  { name: "uniqlo", url: "https://www.uniqlo.com/us/en/" }, // EC, heavy JS
 ];
 
 for (const site of sites) {

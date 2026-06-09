@@ -200,6 +200,30 @@ function Chain({ fixed }: { fixed: boolean }) {
   );
 }
 
+// Scenario 7: huge DOM — rendering tens of thousands of nodes makes style/layout
+// expensive. Fix: windowing/pagination (render only what's visible). Lights up
+// render.nodes (and layout/style cost).
+function HugeDom({ fixed }: { fixed: boolean }) {
+  const [show, setShow] = useState(false);
+  const n = fixed ? 100 : 30000;
+  return (
+    <main>
+      <h1>huge-dom {fixed ? "(fixed)" : "(slow)"}</h1>
+      <button id="render" type="button" onClick={() => setShow(true)}>
+        render
+      </button>
+      <div id="status">{show ? "done" : "idle"}</div>
+      {show && (
+        <ul>
+          {Array.from({ length: n }, (_, i) => (
+            <li key={i}>row {i}</li>
+          ))}
+        </ul>
+      )}
+    </main>
+  );
+}
+
 // ===========================================================================
 // Initialization bucket: resource problems on the scenario's initial load.
 // Each shows a "ready" marker only once init is done, so the initial-load span
@@ -294,6 +318,8 @@ export function App() {
       return <NPlusOne fixed={fixed} />;
     case "chain":
       return <Chain fixed={fixed} />;
+    case "huge-dom":
+      return <HugeDom fixed={fixed} />;
     default:
       return <Rerender fixed={fixed} />;
   }

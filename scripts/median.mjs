@@ -81,6 +81,7 @@ function aggregateSlug(slug, runs) {
       recalcStyleMs: statBy(items, (s) => s.render?.recalcStyleMs ?? 0),
       layoutCount: statBy(items, (s) => s.render?.layoutCount ?? 0),
       layoutMs: statBy(items, (s) => s.render?.layoutMs ?? 0),
+      nodes: statBy(items, (s) => s.render?.nodes ?? 0),
       scriptMs: statBy(items, (s) => s.render?.scriptMs ?? 0),
     };
     if (hasPaint) {
@@ -141,6 +142,7 @@ const STAT_OF = {
   waves: (s) => s.network.waves,
   busyMs: (s) => s.network.busyMs,
   layoutCount: (s) => s.render.layoutCount,
+  nodes: (s) => s.render.nodes,
 };
 
 /**
@@ -192,7 +194,7 @@ function printSummary(agg) {
       ? `  paint=${fmt(r.paintCount)}/${fmt(r.paintMs)}ms  gpu=${fmt(r.gpuMs)}ms`
       : "";
     lines.push(
-      `      render style=${fmt(r.recalcStyleCount)}/${fmt(r.recalcStyleMs)}ms  layout=${fmt(r.layoutCount)}/${fmt(r.layoutMs)}ms  script=${fmt(r.scriptMs)}ms${paint}`,
+      `      render style=${fmt(r.recalcStyleCount)}/${fmt(r.recalcStyleMs)}ms  layout=${fmt(r.layoutCount)}/${fmt(r.layoutMs)}ms  nodes=${fmt(r.nodes)}  script=${fmt(r.scriptMs)}ms${paint}`,
     );
   }
   if (agg.appSpans.length) {
