@@ -141,6 +141,58 @@ function Network({ fixed }: { fixed: boolean }) {
   );
 }
 
+const get = (q: string) => fetch(`/api/slow?ms=150&${q}`).then((r) => r.text());
+
+// Scenario 5: N+1 — fetch a list, then one request per item. Fix with a batch
+// endpoint (one request). Lights up requestCount and waves.
+function NPlusOne({ fixed }: { fixed: boolean }) {
+  const [status, setStatus] = useState("idle");
+  const run = async () => {
+    setStatus("loading");
+    await get("list");
+    if (fixed) {
+      await get("batch=0,1,2,3,4");
+    } else {
+      for (let i = 0; i < 5; i++) await get(`item=${i}`);
+    }
+    setStatus("done");
+  };
+  return (
+    <main>
+      <h1>n+1 {fixed ? "(fixed)" : "(slow)"}</h1>
+      <button id="load" type="button" onClick={run}>
+        load
+      </button>
+      <div id="status">{status}</div>
+    </main>
+  );
+}
+
+// Scenario 6: dependent chain — each request needs the previous result, so it
+// can't be parallelized. Fix with a single combined endpoint. Lights up waves.
+function Chain({ fixed }: { fixed: boolean }) {
+  const [status, setStatus] = useState("idle");
+  const run = async () => {
+    setStatus("loading");
+    if (fixed) {
+      await get("combined");
+    } else {
+      let prev = "";
+      for (let i = 0; i < 4; i++) prev = await get(`step=${i}&after=${prev}`);
+    }
+    setStatus("done");
+  };
+  return (
+    <main>
+      <h1>chain {fixed ? "(fixed)" : "(slow)"}</h1>
+      <button id="load" type="button" onClick={run}>
+        load
+      </button>
+      <div id="status">{status}</div>
+    </main>
+  );
+}
+
 export function App() {
   const p = params();
   const fixed = p.has("fixed");
@@ -151,6 +203,10 @@ export function App() {
       return <InputFilter fixed={fixed} />;
     case "network":
       return <Network fixed={fixed} />;
+    case "nplus1":
+      return <NPlusOne fixed={fixed} />;
+    case "chain":
+      return <Chain fixed={fixed} />;
     default:
       return <Rerender fixed={fixed} />;
   }
