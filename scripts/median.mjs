@@ -16,19 +16,39 @@ import path from "node:path";
 
 const DIR = path.resolve(process.env.PERF_OUT_DIR ?? "perf-results");
 
+const round = (n) => Math.round(n * 10) / 10;
+
+/** Nearest-rank percentile (p in 0..1) of a sorted array. */
+function percentile(sorted, p) {
+  if (sorted.length === 0) return 0;
+  const i = Math.round((sorted.length - 1) * p);
+  return sorted[i];
+}
+
 function median(values) {
   if (values.length === 0) return 0;
   const s = [...values].sort((a, b) => a - b);
   const mid = Math.floor(s.length / 2);
-  const m = s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
-  return Math.round(m * 10) / 10;
+  return round(s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2);
 }
 
+// A robust summary: median with an IQR band (p25..p75), so a single bad run does
+// not blow up the reported spread the way min..max does. `noisy` flags a median
+// that's too unstable to trust (wide IQR relative to the median) — increase runs
+// or don't gate on it. Small medians are never flagged (relative spread is moot).
 function stat(values) {
+  const s = [...values].sort((a, b) => a - b);
+  const med = median(values);
+  const p25 = round(percentile(s, 0.25));
+  const p75 = round(percentile(s, 0.75));
+  const noisy = med > 5 && (p75 - p25) / med > 0.25;
   return {
-    median: median(values),
-    min: Math.round(Math.min(...values) * 10) / 10,
-    max: Math.round(Math.max(...values) * 10) / 10,
+    median: med,
+    p25,
+    p75,
+    min: round(Math.min(...values)),
+    max: round(Math.max(...values)),
+    noisy,
     n: values.length,
   };
 }
@@ -106,36 +126,46 @@ function aggregateSlug(slug, runs) {
   return { slug, runs: runs.length, vitals, spans, appSpans };
 }
 
+// median with an IQR band; "!" marks a noisy (unstable) median.
 function fmt(s) {
-  return `${s.median} (${s.min}..${s.max})`;
+  return `${s.median} (${s.p25}..${s.p75})${s.noisy ? " !noisy" : ""}`;
 }
 
-// budget field -> aggregated median accessor
-const MEDIAN_OF = {
-  durationMs: (s) => s.durationMs.median,
-  scriptMs: (s) => s.render.scriptMs.median,
-  blockingMs: (s) => s.cpu.blockingMs.median,
-  encodedKB: (s) => s.network.encodedKB.median,
-  requestCount: (s) => s.network.requestCount.median,
-  waves: (s) => s.network.waves.median,
-  busyMs: (s) => s.network.busyMs.median,
-  layoutCount: (s) => s.render.layoutCount.median,
+// budget field -> aggregated stat accessor
+const STAT_OF = {
+  durationMs: (s) => s.durationMs,
+  scriptMs: (s) => s.render.scriptMs,
+  blockingMs: (s) => s.cpu.blockingMs,
+  encodedKB: (s) => s.network.encodedKB,
+  requestCount: (s) => s.network.requestCount,
+  waves: (s) => s.network.waves,
+  busyMs: (s) => s.network.busyMs,
+  layoutCount: (s) => s.render.layoutCount,
 };
 
-/** Budget violations against the median (the statistically sound CI gate). */
+/**
+ * Budget check against the median (robust to outliers). Returns hard violations
+ * (median > budget) plus soft warnings for noisy metrics whose IQR straddles the
+ * budget — the gate could flip run-to-run, so increase --repeat-each before trusting it.
+ */
 function checkBudget(agg) {
-  const out = [];
+  const violations = [];
+  const warnings = [];
   for (const s of agg.spans) {
     if (!s.budget) continue;
     for (const [k, limit] of Object.entries(s.budget)) {
-      if (limit == null || !MEDIAN_OF[k]) continue;
-      const median = MEDIAN_OF[k](s);
-      if (median > limit) {
-        out.push(`${agg.slug} / ${s.name}.${k} median=${median} > budget ${limit}`);
+      if (limit == null || !STAT_OF[k]) continue;
+      const st = STAT_OF[k](s);
+      if (st.median > limit) {
+        violations.push(`${agg.slug} / ${s.name}.${k} median=${st.median} > budget ${limit}`);
+      } else if (st.noisy && st.p75 > limit) {
+        warnings.push(
+          `${agg.slug} / ${s.name}.${k} median=${st.median} <= ${limit} but noisy (p75=${st.p75}) — gate may be flaky, add runs`,
+        );
       }
     }
   }
-  return out;
+  return { violations, warnings };
 }
 
 function printSummary(agg) {
@@ -195,6 +225,7 @@ function main() {
   }
 
   const violations = [];
+  const warnings = [];
   for (const [slug, runFiles] of bySlug) {
     const runs = runFiles.map((f) =>
       JSON.parse(fs.readFileSync(path.join(DIR, f), "utf8")),
@@ -205,9 +236,15 @@ function main() {
       JSON.stringify(agg, null, 2),
     );
     printSummary(agg);
-    violations.push(...checkBudget(agg));
+    const r = checkBudget(agg);
+    violations.push(...r.violations);
+    warnings.push(...r.warnings);
   }
 
+  if (warnings.length > 0) {
+    console.error(`\n[median] noisy budget metrics (${warnings.length}):`);
+    for (const w of warnings) console.error(`  ~ ${w}`);
+  }
   if (violations.length > 0) {
     console.error(`\n[median] BUDGET EXCEEDED (${violations.length}):`);
     for (const v of violations) console.error(`  ! ${v}`);

@@ -106,10 +106,16 @@ comparisons, run N times and take the median:
 
 ```sh
 pnpm exec playwright test --repeat-each=5
-lightbringer-median            # writes <slug>.median.json, prints median (min..max)
+lightbringer-median            # writes <slug>.median.json, prints median (p25..p75)
 ```
 
-`min..max` is the noise band — how far you can trust the number.
+Each number is shown as `median (p25..p75)` — the IQR band, not min..max, so one
+bad run doesn't blow up the reported spread. A metric whose IQR is wide relative to
+its median is flagged **`!noisy`**: don't trust that median or gate on it without
+more runs. On ad-heavy real sites this is common (e.g. `cpu.block` and recalc counts
+swing run-to-run while `requestCount` stays stable). The budget gate decides on the
+median but warns (`~`) when a budgeted metric is noisy and its IQR straddles the
+budget, since the gate could then flip run-to-run.
 
 ### Drilldown (find the cause)
 
