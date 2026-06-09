@@ -148,6 +148,32 @@ Settle is bounded by `PERF_SETTLE_TIMEOUT` (default 5000ms). If it times out the
 span is flagged `capped` and its `durationMs` should not be trusted (read the
 network / CPU / render breakdown instead).
 
+## Accuracy
+
+Measured against a known busy-loop in a page-owned click handler (see
+`examples/accuracy.spec.ts`):
+
+| metric | accuracy |
+| --- | --- |
+| `render.scriptMs` (CDP ScriptDuration) | ±1ms — the most reliable CPU number |
+| `cpu.blockingMs` (Long Tasks API) | exact when it fires, but lossy (see below) |
+| `durationMs` | ground truth + ~15–30ms harness overhead (CDP round-trips + settle) |
+| tracing observer effect | negligible on `scriptMs` |
+
+Things that bite, learned from the accuracy probe:
+
+- **Work injected via `page.evaluate` is invisible** to the Long Tasks API and to
+  ScriptDuration (only `durationMs` sees it). Drive the work from the page's own
+  scripts/events, not from `evaluate`, or you will measure nothing.
+- **`page.setContent` does not run init scripts** in this setup, so the in-page
+  collector never initializes and vitals / cpu / render silently vanish (only
+  `scriptMs` survives via CDP). Always reach the page with `page.goto` (a
+  `data:text/html,...` URL works). The harness warns (`collectorMissing`) when it
+  detects this.
+- **PerformanceObserver callbacks are async**, so a long task at the very end of a
+  span would be missed; the collector drains `takeRecords()` (`flush`) before
+  reading, which fixes per-span attribution retroactively.
+
 ## Caveats
 
 - **Default headless Chromium uses SwiftShader (software GL).** WebGL / ReadPixels

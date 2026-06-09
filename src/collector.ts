@@ -150,6 +150,8 @@ export interface PerfReport {
   glRenderer?: string;
   /** uncaught page errors during measurement; non-empty means results are suspect */
   pageErrors?: string[];
+  /** true if the in-page collector never ran (e.g. page.setContent without a goto) */
+  collectorMissing?: boolean;
   tracePath?: string;
 }
 
@@ -197,6 +199,8 @@ interface PerfWindow {
       duration: number;
       detail: unknown;
     }>;
+    /** drain pending PerformanceObserver records into the store (see flush below) */
+    flush?: () => void;
   };
 }
 
@@ -217,60 +221,78 @@ function browserCollector() {
     wv.onFCP(record);
   }
 
-  try {
-    new PerformanceObserver((list) => {
-      for (const e of list.getEntries()) {
-        store.longTasks.push({ start: e.startTime, duration: e.duration });
+  // Handlers are shared between the observer callback and flush(): PerformanceObserver
+  // callbacks fire asynchronously, so a long task at the very end of a span would be
+  // missed if we read the store before the callback runs. flush() drains takeRecords()
+  // right before the node side reads, fixing per-span attribution retroactively
+  // (spans are matched by time window, not by arrival order).
+  const drainLongTask = (entries: PerformanceEntryList) => {
+    for (const e of entries)
+      store.longTasks.push({ start: e.startTime, duration: e.duration });
+  };
+  const drainLoaf = (entries: PerformanceEntryList) => {
+    for (const e of entries) {
+      const loaf = e as PerformanceEntry & { blockingDuration?: number };
+      store.loaf.push({
+        start: loaf.startTime,
+        duration: loaf.duration,
+        blocking: loaf.blockingDuration ?? 0,
+      });
+    }
+  };
+  const drainMeasure = (entries: PerformanceEntryList) => {
+    for (const e of entries) {
+      const measure = e as PerformanceEntry & { detail?: unknown };
+      const detail = measure.detail;
+      // Only our own spans (the __lbSpan sentinel) — skip framework measures
+      // (React Mount/Update, etc.). detail is read here because toJSON() omits it.
+      if (
+        !detail ||
+        typeof detail !== "object" ||
+        (detail as { __lbSpan?: unknown }).__lbSpan !== true
+      ) {
+        continue;
       }
-    }).observe({ type: "longtask", buffered: true });
-  } catch {
-    /* longtask unsupported */
-  }
+      store.measures.push({
+        name: measure.name,
+        start: measure.startTime,
+        duration: measure.duration,
+        detail,
+      });
+    }
+  };
 
-  try {
-    new PerformanceObserver((list) => {
-      for (const e of list.getEntries()) {
-        const loaf = e as PerformanceEntry & { blockingDuration?: number };
-        store.loaf.push({
-          start: loaf.startTime,
-          duration: loaf.duration,
-          blocking: loaf.blockingDuration ?? 0,
-        });
-      }
-    }).observe({
-      type: "long-animation-frame",
-      buffered: true,
-    } as PerformanceObserverInit);
-  } catch {
-    /* LoAF unsupported */
-  }
+  const observers: PerformanceObserver[] = [];
+  const observe = (
+    drain: (e: PerformanceEntryList) => void,
+    init: PerformanceObserverInit,
+  ) => {
+    try {
+      const obs = new PerformanceObserver((list) => drain(list.getEntries()));
+      obs.observe(init);
+      observers.push(obs);
+    } catch {
+      /* entry type unsupported */
+    }
+  };
 
-  // Collect app-emitted User Timing measures. PerformanceMeasure.toJSON() omits
-  // detail, so read entry.detail directly here. Only collect measures carrying
-  // the __lbSpan sentinel to skip framework measures (React Mount/Update, etc.).
-  try {
-    new PerformanceObserver((list) => {
-      for (const e of list.getEntries()) {
-        const measure = e as PerformanceEntry & { detail?: unknown };
-        const detail = measure.detail;
-        if (
-          !detail ||
-          typeof detail !== "object" ||
-          (detail as { __lbSpan?: unknown }).__lbSpan !== true
-        ) {
-          continue;
-        }
-        store.measures.push({
-          name: measure.name,
-          start: measure.startTime,
-          duration: measure.duration,
-          detail,
-        });
-      }
-    }).observe({ type: "measure", buffered: true });
-  } catch {
-    /* measure unsupported */
-  }
+  observe(drainLongTask, { type: "longtask", buffered: true });
+  observe(drainLoaf, {
+    type: "long-animation-frame",
+    buffered: true,
+  } as PerformanceObserverInit);
+  observe(drainMeasure, { type: "measure", buffered: true });
+
+  store.flush = () => {
+    for (const obs of observers) {
+      const records = obs.takeRecords();
+      if (records.length === 0) continue;
+      const type = records[0].entryType;
+      if (type === "longtask") drainLongTask(records);
+      else if (type === "long-animation-frame") drainLoaf(records);
+      else if (type === "measure") drainMeasure(records);
+    }
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -782,6 +804,12 @@ function logSummary(report: PerfReport): void {
   lines.push(
     `  total network ${report.network.totalRequests} reqs / ${report.network.totalEncodedKB}KB`,
   );
+  if (report.collectorMissing) {
+    lines.push(
+      "  ! in-page collector did not run — vitals / cpu / render are missing." +
+        " Navigate with page.goto (page.setContent does not trigger init scripts).",
+    );
+  }
   if (report.glRenderer && /swiftshader/i.test(report.glRenderer)) {
     lines.push(
       "  ! software GL (SwiftShader): GPU / render numbers are NOT real hardware. Use PERF_GPU=1.",
@@ -826,6 +854,11 @@ export const test = base.extend<{ perf: PerfController }>({
     const controller = new PerfController(page, client);
     await use(controller);
 
+    // Drain pending PerformanceObserver records first (callbacks are async, so a
+    // long task at the end of the last span would otherwise be missed).
+    await page
+      .evaluate(() => (window as unknown as PerfWindow).__perf?.flush?.())
+      .catch(() => {});
     const raw = await page
       .evaluate(() => (window as unknown as PerfWindow).__perf)
       .catch(() => undefined);
@@ -872,6 +905,8 @@ export const test = base.extend<{ perf: PerfController }>({
 
     if (glRenderer) report.glRenderer = glRenderer;
     if (pageErrors.length) report.pageErrors = pageErrors;
+    // raw === undefined means the addInitScript collector never ran in the page.
+    if (raw === undefined) report.collectorMissing = true;
 
     if (traceEvents) {
       const tracePath = path.join(PERF_OUT_DIR, `${slug}.${runTag}.trace.json`);
