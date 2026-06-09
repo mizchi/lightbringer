@@ -12,6 +12,12 @@ const sites = [
   { name: "cnn", url: "https://edition.cnn.com/" }, // US news, ad + video heavy
   { name: "youtube", url: "https://www.youtube.com/" }, // media SPA, heavy hydration
   { name: "weather", url: "https://weather.com/" }, // very JS / ad heavy
+  // SSR/SSG + hydration: fast paint (server HTML, good LCP) but a hidden hydration
+  // cost a paint-only view misses — a CPU long task, a burst of style/layout
+  // recalcs, or layout shift (CLS) as the client bundle attaches.
+  { name: "nextjs", url: "https://nextjs.org/" }, // Next.js (React) hydration
+  { name: "vercel-store", url: "https://demo.vercel.store/" }, // Next.js Commerce demo
+  { name: "nuxt", url: "https://nuxt.com/" }, // Nuxt (Vue) hydration
 ];
 
 for (const site of sites) {
