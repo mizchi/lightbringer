@@ -148,6 +148,38 @@ Settle is bounded by `PERF_SETTLE_TIMEOUT` (default 5000ms). If it times out the
 span is flagged `capped` and its `durationMs` should not be trusted (read the
 network / CPU / render breakdown instead).
 
+## Budgets (CI regression gate)
+
+Declare an upper bound per span; the build fails when it's exceeded. `scriptMs`
+(CDP ScriptDuration) is the recommended bound because it is accurate to ~1ms.
+
+```ts
+await perf.measure(
+  "open-cart",
+  async () => {
+    await page.getByRole("button", { name: "Cart" }).click();
+    await expect(page.getByRole("dialog")).toBeVisible();
+  },
+  { budget: { scriptMs: 80, blockingMs: 100 } },
+);
+```
+
+Two gates, same declared budget:
+
+- **Median gate (recommended for CI):** run N times, then `median.mjs` compares the
+  median to the budget and **exits non-zero** on violation. Robust against the
+  per-run noise of `durationMs` / `blockingMs`.
+
+  ```sh
+  pnpm exec playwright test --repeat-each=5
+  node node_modules/lightbringer/scripts/median.mjs   # exit 1 if any median > budget
+  ```
+
+- **Inline gate (fast local fail):** `PERF_ASSERT=1` fails the test in teardown on
+  the single run. Best for stable metrics (`scriptMs`); off by default.
+
+Either way, violations are also printed in the per-run summary (`! budget: ...`).
+
 ## Accuracy
 
 Measured against a known busy-loop in a page-owned click handler (see

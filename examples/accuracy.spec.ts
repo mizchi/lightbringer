@@ -34,13 +34,24 @@ test.describe("accuracy", () => {
       // no work: whatever shows up is pure harness floor
     });
 
-    await perf.measure("busy-100", async () => {
-      await clickBurn(page, 100);
-    });
+    // budgets are upper bounds on the (very stable) scriptMs. Lower one below the
+    // measured value to see the gate fire (inline with PERF_ASSERT=1, or in the
+    // median script which exits non-zero).
+    await perf.measure(
+      "busy-100",
+      async () => {
+        await clickBurn(page, 100);
+      },
+      { budget: { scriptMs: 200 } },
+    );
 
-    await perf.measure("busy-200", async () => {
-      await clickBurn(page, 200);
-    });
+    await perf.measure(
+      "busy-200",
+      async () => {
+        await clickBurn(page, 200);
+      },
+      { budget: { scriptMs: 300 } },
+    );
 
     await perf.measure("busy-200-with-expect", async () => {
       await clickBurn(page, 200);

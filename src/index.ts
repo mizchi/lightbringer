@@ -2,6 +2,7 @@
 export { test, expect, PerfController } from "./collector";
 export type {
   Settle,
+  Budget,
   PerfReport,
   SpanReport,
   SpanNetwork,

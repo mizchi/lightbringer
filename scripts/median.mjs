@@ -54,6 +54,7 @@ function aggregateSlug(slug, runs) {
       if (!spanNames.includes(s.name)) spanNames.push(s.name);
   const spans = spanNames.map((name) => {
     const items = runs.flatMap((r) => r.spans.filter((s) => s.name === name));
+    const budget = items.find((s) => s.budget)?.budget;
     const hasPaint = items.some((s) => s.render?.paintCount !== undefined);
     const render = {
       recalcStyleCount: statBy(items, (s) => s.render?.recalcStyleCount ?? 0),
@@ -81,6 +82,7 @@ function aggregateSlug(slug, runs) {
         maxLongTaskMs: statBy(items, (s) => s.cpu.maxLongTaskMs),
       },
       render,
+      budget,
     };
   });
 
@@ -106,6 +108,32 @@ function aggregateSlug(slug, runs) {
 
 function fmt(s) {
   return `${s.median} (${s.min}..${s.max})`;
+}
+
+// budget field -> aggregated median accessor
+const MEDIAN_OF = {
+  durationMs: (s) => s.durationMs.median,
+  scriptMs: (s) => s.render.scriptMs.median,
+  blockingMs: (s) => s.cpu.blockingMs.median,
+  encodedKB: (s) => s.network.encodedKB.median,
+  requestCount: (s) => s.network.requestCount.median,
+  layoutCount: (s) => s.render.layoutCount.median,
+};
+
+/** Budget violations against the median (the statistically sound CI gate). */
+function checkBudget(agg) {
+  const out = [];
+  for (const s of agg.spans) {
+    if (!s.budget) continue;
+    for (const [k, limit] of Object.entries(s.budget)) {
+      if (limit == null || !MEDIAN_OF[k]) continue;
+      const median = MEDIAN_OF[k](s);
+      if (median > limit) {
+        out.push(`${agg.slug} / ${s.name}.${k} median=${median} > budget ${limit}`);
+      }
+    }
+  }
+  return out;
 }
 
 function printSummary(agg) {
@@ -164,6 +192,7 @@ function main() {
     process.exit(1);
   }
 
+  const violations = [];
   for (const [slug, runFiles] of bySlug) {
     const runs = runFiles.map((f) =>
       JSON.parse(fs.readFileSync(path.join(DIR, f), "utf8")),
@@ -174,6 +203,13 @@ function main() {
       JSON.stringify(agg, null, 2),
     );
     printSummary(agg);
+    violations.push(...checkBudget(agg));
+  }
+
+  if (violations.length > 0) {
+    console.error(`\n[median] BUDGET EXCEEDED (${violations.length}):`);
+    for (const v of violations) console.error(`  ! ${v}`);
+    process.exit(1);
   }
 }
 

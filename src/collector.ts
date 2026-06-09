@@ -107,6 +107,20 @@ export interface SpanRender {
   gpuMs?: number;
 }
 
+/**
+ * Per-span budget. Each field is an upper bound; the median gate (and optional
+ * inline assert) fails when the measured value exceeds it. scriptMs is the most
+ * reliable bound (±1ms); duration/blocking are noisier — gate them on the median.
+ */
+export interface Budget {
+  durationMs?: number;
+  scriptMs?: number;
+  blockingMs?: number;
+  encodedKB?: number;
+  requestCount?: number;
+  layoutCount?: number;
+}
+
 export interface SpanReport {
   name: string;
   /** measured time from action start until settle (ms) */
@@ -118,6 +132,35 @@ export interface SpanReport {
   render: SpanRender;
   /** span window in trace clock (monotonic μs). Used by the drilldown script. */
   traceWindowUs: [number, number];
+  /** declared budget, if any (carried into the report so the median gate can read it) */
+  budget?: Budget;
+}
+
+/** Map a budget field to the actual value on a span report. */
+const BUDGET_METRIC: Record<keyof Budget, (s: SpanReport) => number> = {
+  durationMs: (s) => s.durationMs,
+  scriptMs: (s) => s.render.scriptMs,
+  blockingMs: (s) => s.cpu.blockingMs,
+  encodedKB: (s) => s.network.encodedKB,
+  requestCount: (s) => s.network.requestCount,
+  layoutCount: (s) => s.render.layoutCount,
+};
+
+/** Budget violations on a single run (actual > budget). */
+function checkBudgets(report: PerfReport): string[] {
+  const out: string[] = [];
+  for (const s of report.spans) {
+    if (!s.budget) continue;
+    for (const k of Object.keys(s.budget) as (keyof Budget)[]) {
+      const limit = s.budget[k];
+      if (limit == null) continue;
+      const actual = BUDGET_METRIC[k](s);
+      if (actual > limit) {
+        out.push(`${s.name}.${k}=${actual} > budget ${limit}`);
+      }
+    }
+  }
+  return out;
 }
 
 /**
@@ -309,6 +352,7 @@ interface RawSpan {
   /** span window in trace clock (monotonic μs) for correlation / drilldown */
   traceStartUs: number;
   traceEndUs: number;
+  budget?: Budget;
 }
 
 /** CDP Performance.getMetrics cumulative counter delta -> render cost */
@@ -343,7 +387,7 @@ export class PerfController {
   async measure(
     name: string,
     action: () => Promise<void>,
-    opts: { settle?: Settle } = {},
+    opts: { settle?: Settle; budget?: Budget } = {},
   ): Promise<void> {
     const startEpochMs = await this.now();
     const before = await this.metrics();
@@ -360,6 +404,7 @@ export class PerfController {
       // getMetrics Timestamp (monotonic seconds) shares the clock with trace ts (μs).
       traceStartUs: (before.Timestamp ?? 0) * 1e6,
       traceEndUs: (after.Timestamp ?? 0) * 1e6,
+      budget: opts.budget,
     });
   }
 
@@ -723,6 +768,7 @@ function buildReport(
       cpu: buildSpanCpu(s, longTasks, loaf),
       render,
       traceWindowUs: [s.traceStartUs, s.traceEndUs],
+      budget: s.budget,
     };
   });
 
@@ -804,6 +850,10 @@ function logSummary(report: PerfReport): void {
   lines.push(
     `  total network ${report.network.totalRequests} reqs / ${report.network.totalEncodedKB}KB`,
   );
+  const violations = checkBudgets(report);
+  for (const v of violations) {
+    lines.push(`  ! budget: ${v}`);
+  }
   if (report.collectorMissing) {
     lines.push(
       "  ! in-page collector did not run — vitals / cpu / render are missing." +
@@ -922,6 +972,16 @@ export const test = base.extend<{ perf: PerfController }>({
     });
 
     logSummary(report);
+
+    // Inline budget assertion (opt-in). Off by default because a single run is
+    // noisy for duration/blocking; the statistically sound gate is the median
+    // script. Enable PERF_ASSERT=1 for fast local fail-fast on stable metrics.
+    if (process.env.PERF_ASSERT === "1") {
+      const violations = checkBudgets(report);
+      if (violations.length > 0) {
+        throw new Error(`perf budget exceeded:\n  ${violations.join("\n  ")}`);
+      }
+    }
   },
 });
 
