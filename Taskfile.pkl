@@ -1,0 +1,53 @@
+amends "https://raw.githubusercontent.com/mizchi/pkfire/main/pkl/Taskfile.pkl"
+
+local sources: Listing<String> = new {
+  "src/**/*.ts"
+  "scripts/**/*.mjs"
+  "examples/**/*.ts"
+}
+
+local typecheck: Task = new {
+  name = "typecheck"
+  cmd = "tsc --noEmit"
+  inputs {
+    ...sources
+    "tsconfig.json"
+  }
+}
+
+local testUnit: Task = new {
+  name = "test:unit"
+  cmd = "vitest run"
+  inputs = sources
+}
+
+local lint: Task = new {
+  name = "lint"
+  cmd = "oxlint"
+  inputs = sources
+}
+
+// secretlint scans the working tree for leaked credentials. Wired to pre-push
+// (not pre-commit) so it runs at the boundary with the outside world.
+local secretlint: Task = new {
+  name = "secretlint"
+  cmd = "npx secretlint --secretlintignore .gitignore \"**/*\""
+  cache = false
+}
+
+local prePush: Task = new {
+  name = "pre-push"
+  cache = false
+  deps {
+    secretlint
+    typecheck
+  }
+}
+
+tasks {
+  typecheck
+  testUnit
+  lint
+  secretlint
+  prePush
+}

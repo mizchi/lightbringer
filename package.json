@@ -1,0 +1,54 @@
+{
+  "name": "lightbringer",
+  "version": "0.0.0",
+  "description": "Per-step web performance measurement for Playwright: network / CPU / render broken down per E2E step, with median aggregation and trace drilldown.",
+  "type": "module",
+  "license": "MIT",
+  "author": "mizchi",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mizchi/lightbringer"
+  },
+  "keywords": [
+    "playwright",
+    "performance",
+    "web-vitals",
+    "cdp",
+    "tracing"
+  ],
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "scripts"
+  ],
+  "bin": {
+    "lightbringer-median": "scripts/median.mjs",
+    "lightbringer-drilldown": "scripts/drilldown.mjs"
+  },
+  "scripts": {
+    "test": "playwright test",
+    "test:unit": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint",
+    "fix": "oxlint --fix",
+    "median": "node scripts/median.mjs",
+    "drilldown": "node scripts/drilldown.mjs"
+  },
+  "dependencies": {
+    "web-vitals": "^5.0.0"
+  },
+  "peerDependencies": {
+    "@playwright/test": ">=1.50.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.0",
+    "@secretlint/secretlint-rule-preset-recommend": "^9.0.0",
+    "oxlint": "^1.0.0",
+    "secretlint": "^9.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^4.0.0"
+  },
+  "packageManager": "pnpm@10.16.0"
+}

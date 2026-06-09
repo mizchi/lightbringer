@@ -1,0 +1,8 @@
+node_modules/
+/perf-results/
+/test-results/
+/playwright-report/
+/dist/
+.direnv/
+*.tsbuildinfo
+.DS_Store
