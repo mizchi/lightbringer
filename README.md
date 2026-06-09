@@ -242,11 +242,20 @@ Things that bite, learned from the accuracy probe:
 
 ## Bench fixtures
 
-`fixtures/app` is a tiny React app with three deliberate, fixable app-JS
-bottlenecks, served by Vite. The specs in `examples/{rerender,reflow,input}.spec.ts`
-measure each and double as regression fixtures for the tool itself. Each lights up
-a **different** metric (CPU / layout / interaction); `?fixed` (or `BENCH_FIXED=1`)
-toggles the fix:
+`fixtures/app` is a tiny React app (served by Vite) with deliberate, fixable
+bottlenecks, grouped by the two halves of the responsibility — **initialization**
+and **between steps**. Each spec in `examples/` measures one and doubles as a
+regression fixture for the tool. `?fixed` (or `BENCH_FIXED=1`) toggles the fix.
+
+**Initialization** (the `initial-load` span):
+
+| scenario | bottleneck | metric | slow → fixed | fix |
+| --- | --- | --- | --- | --- |
+| init-eager | expensive work at boot that the first view doesn't need | `render.scriptMs` | 1038 → 21 ms | don't compute at init (lazy / on demand) |
+| init-waterfall | boot fetches awaited one-by-one (fetch-on-render) | `network.busyMs` | 475 → 169 ms | parallelize the boot fetches |
+| init-reflow | a mount layout effect forces a reflow per element | `render.layoutCount` | 2002 / 402 ms → 3 / 5 ms | batch reads then writes |
+
+**Between steps** (per interaction):
 
 | scenario | bottleneck | metric | slow → fixed | fix |
 | --- | --- | --- | --- | --- |
@@ -254,17 +263,19 @@ toggles the fix:
 | reflow | write-then-read geometry in a loop (forced sync layout) | `render.layoutCount` / `layoutMs` | 2000 / 335 ms → 1 / 1.6 ms | batch reads then writes |
 | input | heavy sync work per keystroke | `vitals.INP` | 64 → 8 ms | `useDeferredValue` |
 | network | four independent requests awaited one-by-one | `network.waves` / `busyMs` | 4 waves / 808 ms → 1 / 203 ms | `Promise.all` |
-| nplus1 | list, then one request per item | `network.requestCount` / `waves` | 6 reqs / 6 waves → 2 / 2 | batch endpoint |
+| nplus1 | list, then one request per item | `network.requestCount` / `waves` | 6 / 6 → 2 / 2 | batch endpoint |
 | chain | each request depends on the previous result | `network.waves` | 4 waves / 608 ms → 1 / 156 ms | combined endpoint |
 
-`reflow` is the instructive one: its `scriptMs` is ~8 ms, so a CPU-only view
-misses it — the layout breakdown is what surfaces the 335 ms. The three network
-scenarios cover the waterfall fix taxonomy with zero CPU cost — **parallelize**
-independent requests (`network`), **batch** N+1 into one (`nplus1`), and
-**combine** a dependent chain into one endpoint when it can't be parallelized
-(`chain`). The `rerender`
-drilldown's self time points straight at the app's own `expensiveValue` (with
-file:line), not a library.
+Notes worth internalizing:
+
+- `reflow` / `init-reflow`: `scriptMs` is only ~5–8 ms, so a CPU-only view misses
+  them — the layout breakdown is what surfaces the cost.
+- the network trio is the waterfall fix taxonomy with zero CPU: **parallelize**
+  independent requests, **batch** an N+1, **combine** a dependent chain.
+- `init-eager`: deferring the work to idle would **not** help — that reschedules it
+  without reducing the resource used at init; the fix is to not do it at init.
+- the `rerender` drilldown's self time points straight at the app's own
+  `expensiveValue` (with file:line), not a library.
 
 ```sh
 npx playwright test reflow.spec.ts                 # slow

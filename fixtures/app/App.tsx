@@ -1,4 +1,11 @@
-import { memo, useDeferredValue, useMemo, useState } from "react";
+import {
+  memo,
+  useDeferredValue,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useState,
+} from "react";
 
 const params = () => new URLSearchParams(location.search);
 
@@ -193,10 +200,90 @@ function Chain({ fixed }: { fixed: boolean }) {
   );
 }
 
+// ===========================================================================
+// Initialization bucket: resource problems on the scenario's initial load.
+// Each shows a "ready" marker only once init is done, so the initial-load span
+// captures the full init cost.
+// ===========================================================================
+
+// init-eager: expensive work done eagerly at boot that isn't needed for the
+// initial view. Fix: don't do it at init (compute lazily, on demand). Deferring
+// to idle would NOT help — it reschedules the work without reducing init resource
+// use; the responsibility is to not spend the resource at init at all.
+// (result is rendered so V8 can't dead-code-eliminate the work.)
+function InitEager({ fixed }: { fixed: boolean }) {
+  const [out, setOut] = useState(0);
+  useEffect(() => {
+    if (!fixed) setOut(expensiveValue(1, 1_500_000_000));
+  }, [fixed]);
+  return (
+    <main>
+      <div id="ready">ready</div>
+      <span hidden>{out}</span>
+    </main>
+  );
+}
+
+// init-waterfall: boot fetches awaited one-by-one (fetch-on-render). Fix: parallel.
+function InitWaterfall({ fixed }: { fixed: boolean }) {
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    void (async () => {
+      if (fixed) {
+        await Promise.all([get("a"), get("b"), get("c")]);
+      } else {
+        await get("a");
+        await get("b");
+        await get("c");
+      }
+      setReady(true);
+    })();
+  }, [fixed]);
+  return <div id="ready">{ready ? "ready" : "loading"}</div>;
+}
+
+// init-reflow: a mount layout effect forces a reflow per element. Fix: batch.
+const INIT_REFLOW_N = 2000;
+function InitReflow({ fixed }: { fixed: boolean }) {
+  const [ready, setReady] = useState(false);
+  useLayoutEffect(() => {
+    const items = Array.from(
+      document.querySelectorAll<HTMLElement>(".init-item"),
+    );
+    if (fixed) {
+      items.forEach((el, i) => (el.style.width = `${100 + (i % 40)}px`));
+      const hs = items.map((el) => el.offsetHeight);
+      items.forEach((el, i) => (el.dataset.h = String(hs[i])));
+    } else {
+      items.forEach((el, i) => {
+        el.style.width = `${100 + (i % 40)}px`;
+        el.dataset.h = String(el.offsetHeight);
+      });
+    }
+    setReady(true);
+  }, [fixed]);
+  return (
+    <main>
+      <div id="ready">{ready ? "ready" : "loading"}</div>
+      {Array.from({ length: INIT_REFLOW_N }, (_, i) => (
+        <div key={i} className="init-item" style={{ height: 8 }}>
+          {i}
+        </div>
+      ))}
+    </main>
+  );
+}
+
 export function App() {
   const p = params();
   const fixed = p.has("fixed");
   switch (p.get("scenario")) {
+    case "init-eager":
+      return <InitEager fixed={fixed} />;
+    case "init-waterfall":
+      return <InitWaterfall fixed={fixed} />;
+    case "init-reflow":
+      return <InitReflow fixed={fixed} />;
     case "reflow":
       return <Reflow fixed={fixed} />;
     case "input":

@@ -118,6 +118,7 @@ const MEDIAN_OF = {
   encodedKB: (s) => s.network.encodedKB.median,
   requestCount: (s) => s.network.requestCount.median,
   waves: (s) => s.network.waves.median,
+  busyMs: (s) => s.network.busyMs.median,
   layoutCount: (s) => s.render.layoutCount.median,
 };
 
