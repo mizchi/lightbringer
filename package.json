@@ -1,7 +1,7 @@
 {
   "name": "lightbringer",
   "version": "0.0.0",
-  "description": "Per-step web performance measurement for Playwright: network / CPU / render broken down per E2E step, with median aggregation and trace drilldown.",
+  "description": "Per-step resource measurement for Playwright scenarios: network / CPU / render / INP at initialization and between steps, to optimize a scenario's resource usage. Median regression gate and trace drilldown.",
   "type": "module",
   "license": "MIT",
   "author": "mizchi",

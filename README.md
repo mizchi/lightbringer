@@ -1,13 +1,21 @@
 # lightbringer
 
-Per-step web performance measurement for Playwright.
+Per-step resource measurement for Playwright scenarios.
 
-Lighthouse only measures the initial load. For SPAs and interaction-heavy pages,
-the expensive work happens **after** an interaction (route changes, data fetches,
-re-renders, map/canvas redraws). lightbringer wraps each step of a Playwright
-scenario and breaks its cost into **network**, **CPU**, and **render**, so the
-only way to move the number is to change the implementation — not how the test
-waits.
+**Responsibility:** lightbringer measures the resources a Playwright scenario
+consumes — at its **initialization** (the initial load) and **between its steps**
+(each interaction / transition) — so you can optimize that resource usage. It
+breaks each step's cost into **network**, **CPU**, and **render** (plus web-vitals
+including INP), so the only way to move a number is to change the implementation,
+not how the test waits.
+
+Lighthouse only measures the initial load; lightbringer covers the whole scenario
+lifecycle, step by step.
+
+**In scope:** per-step network / CPU / render / INP of one scenario, a median gate
+for regressions, and a trace drilldown to the responsible code.
+**Out of scope (non-goals):** a general always-on profiler, cross-scenario / whole-
+suite analysis, and memory / leak detection.
 
 ```
 [perf] measure initial load and a follow-up navigation
