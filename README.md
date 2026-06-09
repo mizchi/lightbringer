@@ -79,13 +79,17 @@ pnpm exec playwright test --repeat-each=5        # multiple runs for median
 node node_modules/lightbringer/scripts/median.mjs
 ```
 
-### CPU throttling (find bottlenecks hidden by a fast machine)
+### CPU & network throttling (find bottlenecks hidden by a fast machine)
 
-A fast dev machine makes app JS look free. `PERF_CPU=N` slows the CPU N times via
-CDP (`Emulation.setCPUThrottlingRate`), so React re-render storms and heavy
-synchronous work surface as long tasks. GPU/GL is **not** throttled, so this
-isolates the JS/main-thread cost. Note that the page's own fixed `waitFor`
-timeouts may need raising under heavy throttle.
+A fast dev machine on localhost hides both CPU and network cost.
+
+- **`PERF_CPU=N`** slows the CPU N times (`Emulation.setCPUThrottlingRate`), so
+  React re-render storms surface as long tasks. GPU/GL is **not** throttled, so it
+  isolates JS/main-thread cost. The test timeout is auto-scaled by N; the global
+  `expect()` timeout is not (raise it in config or pass an explicit timeout).
+- **`PERF_NET=slow-3g|fast-3g|4g`** emulates a slower network
+  (`Network.emulateNetworkConditions`), so payload size and waterfall depth have
+  realistic cost (relevant when validating code-splitting / lazy loading).
 
 ### Median (kill the noise)
 

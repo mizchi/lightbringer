@@ -108,8 +108,36 @@ const fnRanked = [...byFn.entries()]
 // stream (node id per sample) and timeDeltas (μs between samples). Self time of a
 // node = sum of timeDeltas for samples landing on it. Unlike the function totals
 // above (which include children), this is each frame's own cost.
-const nodeFrame = new Map(); // nodeId -> "functionName  url:line"
-const selfByFrame = new Map(); // frame -> selfMs
+// Known harness frames: Playwright's injected actionability/visibility helpers
+// (no script URL) and lightbringer's own in-page collector. Used to separate
+// measurement overhead from real app/library self time (frames that have a URL).
+const HARNESS_NAMES = new Set([
+  "getComputedStyle",
+  "getElementComputedStyle",
+  "isElementStyleVisibilityVisible",
+  "isVisible",
+  "elementState",
+  "processElement",
+  "getCSSContent",
+  "visit",
+  "oneLine",
+  "generateSelector",
+  "querySelectorAll",
+  "ariaSnapshot",
+  "getTextAlternativeInternal",
+  "getExplicitAriaRole",
+  "getImplicitAriaRole",
+  "belongsToDisplayNoneOrAriaHiddenOrNonSlotted",
+  "InjectedScript",
+  "browserCollector",
+  "drainLongTask",
+  "drainLoaf",
+  "drainMeasure",
+]);
+
+const nodeFrame = new Map(); // nodeId -> { label, kind } | null
+const selfByFrame = new Map(); // label -> { ms, kind }
+const selfByKind = { app: 0, harness: 0, native: 0 };
 let profileStartUs = null;
 let cursorUs = null;
 
@@ -129,8 +157,10 @@ for (const e of events) {
       nodeFrame.set(n.id, null);
       continue;
     }
+    // app = has a script URL; harness = known injected/collector name; native = rest
+    const kind = cf.url ? "app" : HARNESS_NAMES.has(fn) ? "harness" : "native";
     const loc = cf.url ? `${shorten(cf.url)}:${(cf.lineNumber ?? 0) + 1}` : "";
-    nodeFrame.set(n.id, `${fn}  ${loc}`);
+    nodeFrame.set(n.id, { label: `${fn}  ${loc}`, kind });
   }
   const samples = cp.samples ?? [];
   const deltas = e.args.data.timeDeltas ?? cp.timeDeltas ?? [];
@@ -141,11 +171,14 @@ for (const e of events) {
     if (cursorUs < startUs || cursorUs > endUs) continue;
     const frame = nodeFrame.get(samples[i]);
     if (!frame) continue;
-    selfByFrame.set(frame, (selfByFrame.get(frame) ?? 0) + dt / 1000);
+    const cur = selfByFrame.get(frame.label) ?? { ms: 0, kind: frame.kind };
+    cur.ms += dt / 1000;
+    selfByFrame.set(frame.label, cur);
+    selfByKind[frame.kind] += dt / 1000;
   }
 }
 const selfRanked = [...selfByFrame.entries()]
-  .map(([key, ms]) => ({ key, selfMs: round(ms) }))
+  .map(([key, v]) => ({ key, selfMs: round(v.ms), kind: v.kind }))
   .filter((r) => r.selfMs > 0)
   .sort((a, b) => b.selfMs - a.selfMs)
   .slice(0, topN);
@@ -172,12 +205,16 @@ for (const r of fnRanked) {
   console.log(`    ${String(r.totalMs).padStart(8)}ms x${r.count}  ${r.key}`);
 }
 
-console.log(`\n  function SELF time top ${topN} (own cost, from CPU profiler):`);
+console.log(
+  `\n  function SELF time top ${topN} (own cost, from CPU profiler):` +
+    `  [app ${round(selfByKind.app)}ms / harness ${round(selfByKind.harness)}ms / native ${round(selfByKind.native)}ms]`,
+);
 if (selfRanked.length === 0) {
   console.log(
     "    no CPU profiler samples in window (was PERF_TRACE=1 with v8.cpu_profiler?)",
   );
 }
 for (const r of selfRanked) {
-  console.log(`    ${String(r.selfMs).padStart(8)}ms  ${r.key}`);
+  const tag = r.kind === "app" ? "" : `  [${r.kind}]`;
+  console.log(`    ${String(r.selfMs).padStart(8)}ms  ${r.key}${tag}`);
 }

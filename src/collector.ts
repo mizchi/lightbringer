@@ -51,6 +51,20 @@ const CPU_RATE = Number(process.env.PERF_CPU ?? "1");
 /** Max time to wait for settle before marking a span capped (ms). */
 const SETTLE_TIMEOUT_MS = Number(process.env.PERF_SETTLE_TIMEOUT ?? "5000");
 
+/**
+ * PERF_NET selects a network emulation profile via CDP. Throughput in bytes/s,
+ * latency in ms. Approximate DevTools-style presets.
+ */
+const NET_PROFILES: Record<
+  string,
+  { latency: number; downloadThroughput: number; uploadThroughput: number }
+> = {
+  "slow-3g": { latency: 400, downloadThroughput: 51_200, uploadThroughput: 51_200 },
+  "fast-3g": { latency: 150, downloadThroughput: 196_608, uploadThroughput: 98_304 },
+  "4g": { latency: 40, downloadThroughput: 1_179_648, uploadThroughput: 589_824 },
+};
+const NET_PROFILE = NET_PROFILES[process.env.PERF_NET ?? ""];
+
 // ---------------------------------------------------------------------------
 // Report types (the contract layer)
 // ---------------------------------------------------------------------------
@@ -891,6 +905,14 @@ export const test = base.extend<{ perf: PerfController }>({
     const pageErrors: string[] = [];
     page.on("pageerror", (e) => pageErrors.push(String(e)));
 
+    // Scale the test timeout under CPU throttling: a page that runs N times slower
+    // makes fixed waitFor / navigation timeouts trip. (The expect() timeout is a
+    // global config and can't be changed per-test at runtime — raise it in config
+    // or pass an explicit timeout when throttling hard.)
+    if (CPU_RATE > 1 && testInfo.timeout > 0) {
+      testInfo.setTimeout(testInfo.timeout * CPU_RATE);
+    }
+
     const client = await page.context().newCDPSession(page);
     await client.send("Performance.enable");
     // PERF_CPU=N slows the CPU N times (mid-tier device emulation). GL/GPU is not
@@ -899,6 +921,13 @@ export const test = base.extend<{ perf: PerfController }>({
       await client.send("Emulation.setCPUThrottlingRate", { rate: CPU_RATE });
     }
     const finishNetwork = await startNetworkCapture(client);
+    // PERF_NET emulates a slower network so payload / waterfall costs are realistic.
+    if (NET_PROFILE) {
+      await client.send("Network.emulateNetworkConditions", {
+        offline: false,
+        ...NET_PROFILE,
+      });
+    }
     const finishTrace = TRACE_ENABLED ? await startTrace(client) : undefined;
 
     const controller = new PerfController(page, client);
