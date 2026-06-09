@@ -198,6 +198,16 @@ Two gates, same declared budget:
 
 Either way, violations are also printed in the per-run summary (`! budget: ...`).
 
+Span budget fields: `durationMs`, `scriptMs`, `blockingMs`, `encodedKB`,
+`requestCount`, `waves`, `busyMs`, `layoutCount`, `nodes`. For page-global
+web-vitals, declare a separate budget once per test:
+
+```ts
+perf.setVitalsBudget({ LCP: 2500, INP: 200, CLS: 0.1 });
+```
+
+It's gated the same way (median, with noisy warnings).
+
 ## Accuracy
 
 Measured against a known busy-loop in a page-owned click handler (see
@@ -265,6 +275,7 @@ regression fixture for the tool. `?fixed` (or `BENCH_FIXED=1`) toggles the fix.
 | init-eager | expensive work at boot that the first view doesn't need | `render.scriptMs` | 1038 → 21 ms | don't compute at init (lazy / on demand) |
 | init-waterfall | boot fetches awaited one-by-one (fetch-on-render) | `network.busyMs` | 475 → 169 ms | parallelize the boot fetches |
 | init-reflow | a mount layout effect forces a reflow per element | `render.layoutCount` | 2002 / 402 ms → 3 / 5 ms | batch reads then writes |
+| cls | a banner inserted after load pushes content down | `vitals.CLS` | 0.4 (poor) → 0 | reserve the space up front |
 
 **Between steps** (per interaction):
 
@@ -276,6 +287,7 @@ regression fixture for the tool. `?fixed` (or `BENCH_FIXED=1`) toggles the fix.
 | network | four independent requests awaited one-by-one | `network.waves` / `busyMs` | 4 waves / 808 ms → 1 / 203 ms | `Promise.all` |
 | nplus1 | list, then one request per item | `network.requestCount` / `waves` | 6 / 6 → 2 / 2 | batch endpoint |
 | chain | each request depends on the previous result | `network.waves` | 4 waves / 608 ms → 1 / 156 ms | combined endpoint |
+| huge-dom | rendering 30k list items | `render.nodes` | ~120k nodes / layout 100 ms → ~400 / fast | windowing / pagination |
 
 Notes worth internalizing:
 

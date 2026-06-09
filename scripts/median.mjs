@@ -124,7 +124,8 @@ function aggregateSlug(slug, runs) {
     };
   });
 
-  return { slug, runs: runs.length, vitals, spans, appSpans };
+  const vitalsBudget = runs.find((r) => r.vitalsBudget)?.vitalsBudget;
+  return { slug, runs: runs.length, vitals, vitalsBudget, spans, appSpans };
 }
 
 // median with an IQR band; "!" marks a noisy (unstable) median.
@@ -163,6 +164,19 @@ function checkBudget(agg) {
       } else if (st.noisy && st.p75 > limit) {
         warnings.push(
           `${agg.slug} / ${s.name}.${k} median=${st.median} <= ${limit} but noisy (p75=${st.p75}) — gate may be flaky, add runs`,
+        );
+      }
+    }
+  }
+  if (agg.vitalsBudget) {
+    for (const [k, limit] of Object.entries(agg.vitalsBudget)) {
+      const st = agg.vitals[k];
+      if (limit == null || !st) continue;
+      if (st.median > limit) {
+        violations.push(`${agg.slug} / vitals.${k} median=${st.median} > budget ${limit}`);
+      } else if (st.noisy && st.p75 > limit) {
+        warnings.push(
+          `${agg.slug} / vitals.${k} median=${st.median} <= ${limit} but noisy (p75=${st.p75})`,
         );
       }
     }

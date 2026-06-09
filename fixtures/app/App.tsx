@@ -224,6 +224,34 @@ function HugeDom({ fixed }: { fixed: boolean }) {
   );
 }
 
+// Scenario 8: layout shift (CLS). A banner is inserted at the top ~400ms after
+// load, pushing content down. Fix: reserve the space up front so nothing shifts.
+// Lights up vitals.CLS (visual stability — orthogonal to CPU/network/render).
+function Cls({ fixed }: { fixed: boolean }) {
+  const [banner, setBanner] = useState(false);
+  useEffect(() => {
+    const t = setTimeout(() => setBanner(true), 400);
+    return () => clearTimeout(t);
+  }, []);
+  return (
+    <main>
+      {/* slow: height grows 0 -> 120 when the banner arrives (shift). fixed: the
+          space is reserved from the start, so the banner fills it with no shift. */}
+      <div style={{ minHeight: fixed ? 500 : banner ? 500 : 0 }}>
+        {banner && (
+          <div id="banner" style={{ height: 500, background: "#ccc" }}>
+            late banner
+          </div>
+        )}
+      </div>
+      <h1 id="content">content</h1>
+      {Array.from({ length: 30 }, (_, i) => (
+        <p key={i}>line {i}</p>
+      ))}
+    </main>
+  );
+}
+
 // ===========================================================================
 // Initialization bucket: resource problems on the scenario's initial load.
 // Each shows a "ready" marker only once init is done, so the initial-load span
@@ -320,6 +348,8 @@ export function App() {
       return <Chain fixed={fixed} />;
     case "huge-dom":
       return <HugeDom fixed={fixed} />;
+    case "cls":
+      return <Cls fixed={fixed} />;
     default:
       return <Rerender fixed={fixed} />;
   }

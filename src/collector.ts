@@ -183,6 +183,15 @@ function checkBudgets(report: PerfReport): string[] {
       }
     }
   }
+  if (report.vitalsBudget) {
+    for (const k of Object.keys(report.vitalsBudget) as (keyof VitalsBudget)[]) {
+      const limit = report.vitalsBudget[k];
+      const actual = report.vitals[k]?.value;
+      if (limit != null && actual != null && actual > limit) {
+        out.push(`vitals.${k}=${actual} > budget ${limit}`);
+      }
+    }
+  }
   return out;
 }
 
@@ -203,10 +212,21 @@ export interface NetworkReport {
   slowest: Array<{ url: string; type: string; durationMs: number; kb: number }>;
 }
 
+/** Upper bounds on page-global web-vitals (gated on the median, like span budgets). */
+export interface VitalsBudget {
+  LCP?: number;
+  INP?: number;
+  CLS?: number;
+  TTFB?: number;
+  FCP?: number;
+}
+
 export interface PerfReport {
   title: string;
   url: string;
   vitals: Record<string, VitalSample>;
+  /** declared web-vitals budget, if any (carried so the median gate can read it) */
+  vitalsBudget?: VitalsBudget;
   spans: SpanReport[];
   /** spans derived from app-code measures (OTel shape) */
   appSpans: AppSpanReport[];
@@ -396,11 +416,17 @@ function diffMetrics(
 
 export class PerfController {
   readonly spans: RawSpan[] = [];
+  vitalsBudget: VitalsBudget = {};
   constructor(
     private page: Page,
     private client: CDPSession,
     private settle: Settle = defaultSettle,
   ) {}
+
+  /** Declare upper bounds on web-vitals (LCP / INP / CLS / TTFB / FCP) for this test. */
+  setVitalsBudget(budget: VitalsBudget): void {
+    this.vitalsBudget = budget;
+  }
 
   /**
    * Measure a named operation. Runs action, waits for the page to settle, and
@@ -1005,6 +1031,8 @@ export const test = base.extend<{ perf: PerfController }>({
 
     if (glRenderer) report.glRenderer = glRenderer;
     if (pageErrors.length) report.pageErrors = pageErrors;
+    if (Object.keys(controller.vitalsBudget).length > 0)
+      report.vitalsBudget = controller.vitalsBudget;
     // raw === undefined means the addInitScript collector never ran in the page.
     if (raw === undefined) report.collectorMissing = true;
 
