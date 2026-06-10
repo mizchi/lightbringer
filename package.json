@@ -1,6 +1,6 @@
 {
   "name": "lightbringer",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Per-step resource measurement for Playwright scenarios: network / CPU / render / INP at initialization and between steps, to optimize a scenario's resource usage. Median regression gate and trace drilldown.",
   "type": "module",
   "license": "MIT",
@@ -17,10 +17,13 @@
     "tracing"
   ],
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
   },
   "files": [
-    "src",
+    "dist",
     "scripts"
   ],
   "bin": {
@@ -28,6 +31,8 @@
     "lightbringer-drilldown": "scripts/drilldown.mjs"
   },
   "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --clean",
+    "prepublishOnly": "tsup src/index.ts --format esm --dts --clean",
     "test": "playwright test",
     "test:unit": "vitest run",
     "typecheck": "tsc --noEmit",
@@ -52,6 +57,7 @@
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "secretlint": "^9.0.0",
+    "tsup": "^8.5.1",
     "typescript": "^5.7.0",
     "vite": "^8.0.16",
     "vitest": "^4.0.0"
