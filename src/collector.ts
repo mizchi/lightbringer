@@ -588,11 +588,38 @@ async function startNetworkCapture(
 
 async function startTrace(
   client: CDPSession,
-): Promise<() => Promise<unknown[]>> {
-  const events: unknown[] = [];
+  tracePath: string,
+): Promise<() => Promise<{ renderEvents: TraceEvent[] }>> {
+  // A heavy page emits tens-to-hundreds of MB of trace events. Holding them all
+  // in a JS array and JSON.stringify-ing at the end peaks at 2x that in heap and
+  // OOMs. Instead: stream every event straight to disk for the drilldown, and
+  // keep in memory only the handful aggregation needs (Paint / GPUTask, used to
+  // fill per-span paint/GPU). The drilldown reads the file when it needs the rest.
+  const renderEvents: TraceEvent[] = [];
+  const out = fs.createWriteStream(tracePath);
+  out.write("[");
+  let wroteAny = false;
+  let writeError: Error | undefined;
+  out.on("error", (err) => {
+    writeError = err;
+  });
+
   client.on("Tracing.dataCollected", (e) => {
-    const p = e as unknown as { value: unknown[] };
-    events.push(...p.value);
+    const p = e as unknown as { value: TraceEvent[] };
+    const batch = p.value;
+    // for-loop, NOT events.push(...batch): a single dataCollected batch can
+    // exceed the spread-call argument limit (~120k) and throw RangeError, which
+    // would lose the entire trace on exactly the heavy pages this is meant for.
+    let chunk = "";
+    for (let i = 0; i < batch.length; i++) {
+      const ev = batch[i];
+      chunk += (wroteAny ? "," : "") + JSON.stringify(ev);
+      wroteAny = true;
+      if (ev.ph === "X" && (ev.name === "Paint" || ev.name === "GPUTask")) {
+        renderEvents.push(ev);
+      }
+    }
+    if (chunk) out.write(chunk);
   });
   await client.send("Tracing.start", {
     transferMode: "ReportEvents",
@@ -614,7 +641,11 @@ async function startTrace(
     });
     await client.send("Tracing.end");
     await done;
-    return events;
+    // close the JSON array and flush to disk before we read the file path back
+    await new Promise<void>((resolve, reject) => {
+      out.end("]", () => (writeError ? reject(writeError) : resolve()));
+    });
+    return { renderEvents };
   };
 }
 
@@ -625,6 +656,9 @@ async function startTrace(
 function round(n: number): number {
   return Math.round(n * 10) / 10;
 }
+
+/** Max per-request detail entries kept per span (slowest-first); counts/bytes are full. */
+const REQUESTS_PER_SPAN_LIMIT = 20;
 
 // First-party vs third-party classification by registrable domain.
 // Not a full Public Suffix List — a compact set of common multi-label suffixes
@@ -839,13 +873,17 @@ function buildSpanNetwork(
     tpRecords.push({ url: r.url, encodedKB: (r.encoded ?? 0) / 1024, interval });
   }
   requests.sort((a, b) => b.durationMs - a.durationMs);
+  // Cap the per-request detail list: a span on a request-heavy page can hold
+  // hundreds of entries and bloat every report. Counts/bytes/busy/thirdParty
+  // above are computed over all requests; only the (slowest-first) detail is cut.
+  const requestCount = requests.length;
   return {
-    requestCount: requests.length,
+    requestCount,
     encodedKB: round(encoded / 1024),
     busyMs: round(unionLength(intervals)),
     waves: countWaves(intervals),
     thirdParty: buildThirdParty(tpRecords, firstPartyDomain),
-    requests,
+    requests: requests.slice(0, REQUESTS_PER_SPAN_LIMIT),
   };
 }
 
@@ -929,7 +967,8 @@ function buildReport(
   timeOrigin: number,
   spans: RawSpan[],
   reqs: NetReq[],
-  traceEvents?: TraceEvent[],
+  /** pre-filtered Paint / GPUTask events (not the full trace) for per-span paint/GPU */
+  renderEvents?: TraceEvent[],
 ): PerfReport {
   // The page's own registrable domain anchors first- vs third-party. Falls back
   // to "" (everything counts as first-party) when the URL has no host.
@@ -956,10 +995,10 @@ function buildReport(
   }));
 
   const spanReports: SpanReport[] = spans.map((s) => {
-    const render = traceEvents
+    const render = renderEvents
       ? {
           ...s.render,
-          ...buildTraceRender(traceEvents, s.traceStartUs, s.traceEndUs),
+          ...buildTraceRender(renderEvents, s.traceStartUs, s.traceEndUs),
         }
       : s.render;
     return {
@@ -1141,7 +1180,21 @@ export const test = base.extend<{ perf: PerfController }>({
         ...NET_PROFILE,
       });
     }
-    const finishTrace = TRACE_ENABLED ? await startTrace(client) : undefined;
+
+    // Output paths are derived from testInfo (stable at setup), so the trace can
+    // stream to disk during the run instead of being buffered and written at the
+    // end. Full title path avoids collisions across describe blocks / looped tests.
+    const slug = testInfo.titlePath
+      .filter(Boolean)
+      .join("_")
+      .replace(/[^\p{L}\p{N}_]+/gu, "_");
+    // run index keeps files from colliding under --repeat-each=N (median aggregates <slug>.run*.json).
+    const runTag = `run${testInfo.repeatEachIndex}`;
+    const tracePath = path.join(PERF_OUT_DIR, `${slug}.${runTag}.trace.json`);
+    if (TRACE_ENABLED) fs.mkdirSync(PERF_OUT_DIR, { recursive: true });
+    const finishTrace = TRACE_ENABLED
+      ? await startTrace(client, tracePath)
+      : undefined;
 
     const controller = new PerfController(page, client);
     await use(controller);
@@ -1174,22 +1227,14 @@ export const test = base.extend<{ perf: PerfController }>({
       .catch(() => null);
     const url = page.url();
     const reqs = finishNetwork();
-    // finish the trace before buildReport so Paint/GPU can correlate to spans
-    const traceEvents = finishTrace
-      ? ((await finishTrace()) as TraceEvent[])
+    // finish the trace before buildReport so Paint/GPU can correlate to spans.
+    // The full trace is already streamed to tracePath; this returns only the
+    // small Paint/GPUTask subset aggregation needs.
+    const renderEvents = finishTrace
+      ? (await finishTrace()).renderEvents
       : undefined;
 
     fs.mkdirSync(PERF_OUT_DIR, { recursive: true });
-    // Use the full title path (describe blocks + test title) so tests that share a
-    // title under different describes (e.g. one test body looped over many sites)
-    // don't collide into the same report / median bucket.
-    const slug = testInfo.titlePath
-      .filter(Boolean)
-      .join("_")
-      .replace(/[^\p{L}\p{N}_]+/gu, "_");
-    // run index keeps files from colliding under --repeat-each=N.
-    // The median script aggregates <slug>.run*.json.
-    const runTag = `run${testInfo.repeatEachIndex}`;
 
     const report = buildReport(
       testInfo,
@@ -1198,7 +1243,7 @@ export const test = base.extend<{ perf: PerfController }>({
       timeOrigin,
       controller.spans,
       reqs,
-      traceEvents,
+      renderEvents,
     );
 
     if (glRenderer) report.glRenderer = glRenderer;
@@ -1208,11 +1253,8 @@ export const test = base.extend<{ perf: PerfController }>({
     // raw === undefined means the addInitScript collector never ran in the page.
     if (raw === undefined) report.collectorMissing = true;
 
-    if (traceEvents) {
-      const tracePath = path.join(PERF_OUT_DIR, `${slug}.${runTag}.trace.json`);
-      fs.writeFileSync(tracePath, JSON.stringify(traceEvents));
-      report.tracePath = tracePath;
-    }
+    // the trace file was streamed to disk during the run (see startTrace)
+    if (TRACE_ENABLED) report.tracePath = tracePath;
 
     const jsonPath = path.join(PERF_OUT_DIR, `${slug}.${runTag}.json`);
     fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2));

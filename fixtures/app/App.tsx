@@ -328,6 +328,38 @@ function ThirdParty({ fixed }: { fixed: boolean }) {
   );
 }
 
+// Scenario 12: heavy data — stresses lightbringer's own data handling, not the
+// app. On click it (a) fires many concurrent requests (a large per-span request
+// set) and (b) emits a flood of performance.mark()s, which become a huge batch
+// of trace events. Used to verify the collector survives large Playwright/CDP
+// payloads (the dataCollected batch alone can exceed the spread-call arg limit)
+// and doesn't bloat the report. ?fixed does a small amount.
+function Stress({ fixed }: { fixed: boolean }) {
+  const [status, setStatus] = useState("idle");
+  const run = async () => {
+    setStatus("running");
+    const reqCount = fixed ? 5 : 600;
+    const markCount = fixed ? 100 : 150_000;
+    // a flood of user-timing entries -> a large trace event batch
+    for (let i = 0; i < markCount; i++) performance.mark(`m${i}`);
+    await Promise.all(
+      Array.from({ length: reqCount }, (_, i) =>
+        fetch(`/api/slow?ms=0&i=${i}`).then((r) => r.text()),
+      ),
+    );
+    setStatus("done");
+  };
+  return (
+    <main>
+      <h1>stress {fixed ? "(fixed)" : "(slow)"}</h1>
+      <button id="load" type="button" onClick={run}>
+        load
+      </button>
+      <div id="status">{status}</div>
+    </main>
+  );
+}
+
 // ===========================================================================
 // Initialization bucket: resource problems on the scenario's initial load.
 // Each shows a "ready" marker only once init is done, so the initial-load span
@@ -430,6 +462,8 @@ export function App() {
       return <Paint fixed={fixed} />;
     case "thirdparty":
       return <ThirdParty fixed={fixed} />;
+    case "stress":
+      return <Stress fixed={fixed} />;
     default:
       return <Rerender fixed={fixed} />;
   }

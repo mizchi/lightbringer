@@ -267,6 +267,16 @@ Things that bite, learned from the accuracy probe:
   and `durationMs` reflect the wait window you chose, not a discrete load cost —
   read the discrete metrics (`cpu.block` / `script` / recalc counts / vitals) and
   `waves` / `requestCount` instead.
+- **Heavy traces stream to disk.** A busy page emits tens-to-hundreds of MB of
+  trace events; the collector streams them straight to `<slug>.trace.json` and
+  keeps only Paint/GPUTask in memory, so the fixture doesn't buffer + stringify
+  the whole trace (which would OOM). The `drilldown` script, however, loads the
+  full trace file (`JSON.parse`) — fine for normal traces, but a multi-GB trace
+  will strain it. `examples/stress.spec.ts` is the regression fixture for this.
+- **Per-span request detail is capped at the 20 slowest.** `requestCount`,
+  `encodedKB`, `busyMs`, `waves`, and `thirdParty` are computed over *all*
+  requests; only the per-request `requests[]` list is truncated, so a
+  request-heavy page doesn't bloat every report.
 - **First/third-party split is by registrable domain** (eTLD+1) using a compact
   built-in suffix set, not the full Public Suffix List. It's correct for common
   hosts (subdomains of your site count as first-party; `*.co.uk` etc. handled),
@@ -303,6 +313,12 @@ regression fixture for the tool. `?fixed` (or `BENCH_FIXED=1`) toggles the fix.
 | huge-dom | rendering 30k list items | `render.nodes` | ~120k nodes / layout 100 ms → ~400 / fast | windowing / pagination |
 | paint | animating box-shadow every frame (no layout) | `render.paintCount` (PERF_TRACE) | 196 paints → 4 | animate `transform` (compositor-only) |
 | thirdparty | analytics / ad / tag-manager scripts from another origin | `network.thirdParty` (KB / reqs / CPU) | 4 reqs / 265 KB / 70 ms CPU → 0 | drop / defer / self-host the script |
+
+`stress` is different: it doesn't measure an app bottleneck, it stresses
+lightbringer's own data handling — 600 concurrent requests + a 150k-mark trace
+(~50 MB / ~200k events). It verifies the collector survives a `dataCollected`
+batch larger than the spread-call argument limit and streams the trace to disk
+instead of OOMing. Run it with `PERF_TRACE=1`.
 
 Notes worth internalizing:
 
