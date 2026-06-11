@@ -31,6 +31,32 @@ function shorten(url) {
   return url.replace(/^https?:\/\/[^/]+/, "").slice(0, 70);
 }
 
+// First- vs third-party by registrable domain (mirrors src/collector.ts).
+const MULTI_PART_SUFFIXES = new Set([
+  "co.uk", "gov.uk", "ac.uk", "org.uk", "co.jp", "ne.jp", "or.jp", "go.jp",
+  "ac.jp", "co.kr", "co.in", "co.nz", "co.za", "com.au", "com.br", "com.cn",
+  "com.tw", "com.hk", "com.sg", "com.mx",
+]);
+function hostOf(url) {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+function registrableDomain(host) {
+  if (!host || host.includes(":")) return host;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return host;
+  const parts = host.split(".");
+  if (parts.length <= 2) return host;
+  const last2 = parts.slice(-2).join(".");
+  return MULTI_PART_SUFFIXES.has(last2) ? parts.slice(-3).join(".") : last2;
+}
+function domainOf(url) {
+  const h = hostOf(url);
+  return h ? registrableDomain(h) : null;
+}
+
 const [, , slug, spanName, runArg, topArg] = process.argv;
 if (!slug || !spanName) {
   die("usage: node scripts/drilldown.mjs <slug> <spanName> [run] [topN]");
@@ -53,6 +79,10 @@ if (!span) {
 }
 const [startUs, endUs] = span.traceWindowUs;
 const events = JSON.parse(fs.readFileSync(tracePath, "utf8"));
+
+// The page's own registrable domain: app frames from any other domain are
+// third-party (analytics, tag managers, embedded widgets).
+const firstPartyDomain = domainOf(report.url);
 
 const inWindow = events.filter(
   (e) => e.ph === "X" && e.ts != null && e.ts >= startUs && e.ts <= endUs,
@@ -135,9 +165,12 @@ const HARNESS_NAMES = new Set([
   "drainMeasure",
 ]);
 
-const nodeFrame = new Map(); // nodeId -> { label, kind } | null
-const selfByFrame = new Map(); // label -> { ms, kind }
+const nodeFrame = new Map(); // nodeId -> { label, kind, party } | null
+const selfByFrame = new Map(); // label -> { ms, kind, party }
 const selfByKind = { app: 0, harness: 0, native: 0 };
+// Of the app (has-URL) self time, how much is first- vs third-party script.
+const selfByParty = { first: 0, third: 0 };
+const selfByDomain = new Map(); // third-party domain -> self ms
 let profileStartUs = null;
 let cursorUs = null;
 
@@ -160,7 +193,15 @@ for (const e of events) {
     // app = has a script URL; harness = known injected/collector name; native = rest
     const kind = cf.url ? "app" : HARNESS_NAMES.has(fn) ? "harness" : "native";
     const loc = cf.url ? `${shorten(cf.url)}:${(cf.lineNumber ?? 0) + 1}` : "";
-    nodeFrame.set(n.id, { label: `${fn}  ${loc}`, kind });
+    // For app frames, split first- vs third-party by the script URL's domain.
+    const domain = kind === "app" ? domainOf(cf.url) : null;
+    const party =
+      kind === "app" && firstPartyDomain
+        ? domain === firstPartyDomain
+          ? "first"
+          : "third"
+        : null;
+    nodeFrame.set(n.id, { label: `${fn}  ${loc}`, kind, party, domain });
   }
   const samples = cp.samples ?? [];
   const deltas = e.args.data.timeDeltas ?? cp.timeDeltas ?? [];
@@ -171,17 +212,29 @@ for (const e of events) {
     if (cursorUs < startUs || cursorUs > endUs) continue;
     const frame = nodeFrame.get(samples[i]);
     if (!frame) continue;
-    const cur = selfByFrame.get(frame.label) ?? { ms: 0, kind: frame.kind };
+    const cur =
+      selfByFrame.get(frame.label) ??
+      { ms: 0, kind: frame.kind, party: frame.party, domain: frame.domain };
     cur.ms += dt / 1000;
     selfByFrame.set(frame.label, cur);
     selfByKind[frame.kind] += dt / 1000;
+    if (frame.party) selfByParty[frame.party] += dt / 1000;
+    if (frame.party === "third" && frame.domain) {
+      selfByDomain.set(frame.domain, (selfByDomain.get(frame.domain) ?? 0) + dt / 1000);
+    }
   }
 }
 const selfRanked = [...selfByFrame.entries()]
-  .map(([key, v]) => ({ key, selfMs: round(v.ms), kind: v.kind }))
+  .map(([key, v]) => ({ key, selfMs: round(v.ms), kind: v.kind, party: v.party }))
   .filter((r) => r.selfMs > 0)
   .sort((a, b) => b.selfMs - a.selfMs)
   .slice(0, topN);
+
+// Third-party CPU rolled up per script domain — the "weight" non-app scripts emit.
+const domainRanked = [...selfByDomain.entries()]
+  .map(([domain, ms]) => ({ domain, selfMs: round(ms) }))
+  .filter((r) => r.selfMs > 0)
+  .sort((a, b) => b.selfMs - a.selfMs);
 
 console.log(`\n[drilldown] ${slug}`);
 console.log(
@@ -209,12 +262,25 @@ console.log(
   `\n  function SELF time top ${topN} (own cost, from CPU profiler):` +
     `  [app ${round(selfByKind.app)}ms / harness ${round(selfByKind.harness)}ms / native ${round(selfByKind.native)}ms]`,
 );
+if (firstPartyDomain) {
+  console.log(
+    `    app self split: first-party ${round(selfByParty.first)}ms` +
+      ` / third-party ${round(selfByParty.third)}ms  (page domain: ${firstPartyDomain})`,
+  );
+}
 if (selfRanked.length === 0) {
   console.log(
     "    no CPU profiler samples in window (was PERF_TRACE=1 with v8.cpu_profiler?)",
   );
 }
 for (const r of selfRanked) {
-  const tag = r.kind === "app" ? "" : `  [${r.kind}]`;
+  const tag = r.party === "third" ? "  [3p]" : r.kind === "app" ? "" : `  [${r.kind}]`;
   console.log(`    ${String(r.selfMs).padStart(8)}ms  ${r.key}${tag}`);
+}
+
+if (domainRanked.length > 0) {
+  console.log(`\n  third-party CPU by domain (self time the app didn't author):`);
+  for (const r of domainRanked) {
+    console.log(`    ${String(r.selfMs).padStart(8)}ms  ${r.domain}`);
+  }
 }

@@ -97,6 +97,11 @@ function aggregateSlug(slug, runs) {
         waves: statBy(items, (s) => s.network.waves ?? 0),
         encodedKB: statBy(items, (s) => s.network.encodedKB),
         requestCount: statBy(items, (s) => s.network.requestCount),
+        thirdPartyKB: statBy(items, (s) => s.network.thirdParty?.encodedKB ?? 0),
+        thirdPartyRequestCount: statBy(
+          items,
+          (s) => s.network.thirdParty?.requestCount ?? 0,
+        ),
       },
       cpu: {
         blockingMs: statBy(items, (s) => s.cpu.blockingMs),
@@ -142,6 +147,8 @@ const STAT_OF = {
   requestCount: (s) => s.network.requestCount,
   waves: (s) => s.network.waves,
   busyMs: (s) => s.network.busyMs,
+  thirdPartyKB: (s) => s.network.thirdPartyKB,
+  thirdPartyRequestCount: (s) => s.network.thirdPartyRequestCount,
   layoutCount: (s) => s.render.layoutCount,
   nodes: (s) => s.render.nodes,
   paintMs: (s) => s.render.paintMs, // only present with PERF_TRACE
@@ -203,6 +210,11 @@ function printSummary(agg) {
       `      net    busy=${fmt(s.network.busyMs)}ms  reqs=${fmt(s.network.requestCount)}  waves=${fmt(s.network.waves)}  ${fmt(s.network.encodedKB)}KB` +
         (saturated ? "  (net-saturated: busyMs ≈ window)" : ""),
     );
+    if (s.network.thirdPartyRequestCount && s.network.thirdPartyRequestCount.median > 0) {
+      lines.push(
+        `      3p     reqs=${fmt(s.network.thirdPartyRequestCount)}  ${fmt(s.network.thirdPartyKB)}KB`,
+      );
+    }
     lines.push(
       `      cpu    block=${fmt(s.cpu.blockingMs)}ms  maxTask=${fmt(s.cpu.maxLongTaskMs)}ms`,
     );

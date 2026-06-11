@@ -288,6 +288,46 @@ function Cls({ fixed }: { fixed: boolean }) {
   );
 }
 
+// Scenario 11: third-party scripts. slow loads analytics / ad / tag-manager
+// scripts from a different origin (127.0.0.1 vs the page's localhost) that the
+// app didn't ship — extra bytes, network time, and CPU. fixed loads none. The
+// cost surfaces under network.thirdParty (and the drilldown's third-party self
+// time), separated from first-party app code.
+const TP = "http://127.0.0.1:5173/3p"; // cross-origin to the page (localhost)
+function loadScript(src: string): Promise<void> {
+  return new Promise((resolve) => {
+    const el = document.createElement("script");
+    el.src = src;
+    el.onload = () => resolve();
+    el.onerror = () => resolve();
+    document.head.appendChild(el);
+  });
+}
+function ThirdParty({ fixed }: { fixed: boolean }) {
+  const [status, setStatus] = useState("idle");
+  const run = async () => {
+    setStatus("loading");
+    if (!fixed) {
+      await Promise.all([
+        loadScript(`${TP}/tag.js?name=analytics&ms=120&bytes=80000&cpu=40000000`),
+        loadScript(`${TP}/tag.js?name=ads&ms=200&bytes=150000&cpu=70000000`),
+        loadScript(`${TP}/tag.js?name=tagmanager&ms=60&bytes=40000&cpu=20000000`),
+      ]);
+      void fetch(`${TP}/beacon?e=pageview`, { mode: "no-cors" }).catch(() => {});
+    }
+    setStatus("done");
+  };
+  return (
+    <main>
+      <h1>third-party {fixed ? "(fixed)" : "(slow)"}</h1>
+      <button id="load" type="button" onClick={run}>
+        load
+      </button>
+      <div id="status">{status}</div>
+    </main>
+  );
+}
+
 // ===========================================================================
 // Initialization bucket: resource problems on the scenario's initial load.
 // Each shows a "ready" marker only once init is done, so the initial-load span
@@ -388,6 +428,8 @@ export function App() {
       return <Cls fixed={fixed} />;
     case "paint":
       return <Paint fixed={fixed} />;
+    case "thirdparty":
+      return <ThirdParty fixed={fixed} />;
     default:
       return <Rerender fixed={fixed} />;
   }

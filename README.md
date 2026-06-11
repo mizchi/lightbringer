@@ -39,6 +39,11 @@ Per **span** (one `perf.measure(name, action)` region):
 - **network** (CDP) — request count, transferred KB, `busyMs` (union of request
   intervals = how long the network was actually busy), and `waves` (approximate
   serial-dependency depth of the waterfall).
+- **third-party** — the slice of the network served from a registrable domain
+  other than the page's: bytes the app didn't ship and network time it didn't
+  ask for (analytics, tag managers, ad tech, embedded widgets), broken down per
+  domain (`network.thirdParty`). CPU spent by third-party scripts is attributed
+  by the drilldown, which classifies each CPU-profiler frame by its script URL.
 - **cpu** — long task count, total blocking time, heaviest long task, LoAF.
 - **render** — style recalc / layout count and time (from CDP
   `Performance.getMetrics` cumulative counters), JS execution time; and, with
@@ -199,7 +204,8 @@ Two gates, same declared budget:
 Either way, violations are also printed in the per-run summary (`! budget: ...`).
 
 Span budget fields: `durationMs`, `scriptMs`, `blockingMs`, `encodedKB`,
-`requestCount`, `waves`, `busyMs`, `layoutCount`, `nodes`, `paintCount` /
+`requestCount`, `waves`, `busyMs`, `thirdPartyKB`, `thirdPartyRequestCount`,
+`layoutCount`, `nodes`, `paintCount` /
 `paintMs` (PERF_TRACE only). For page-global
 web-vitals, declare a separate budget once per test:
 
@@ -261,6 +267,12 @@ Things that bite, learned from the accuracy probe:
   and `durationMs` reflect the wait window you chose, not a discrete load cost —
   read the discrete metrics (`cpu.block` / `script` / recalc counts / vitals) and
   `waves` / `requestCount` instead.
+- **First/third-party split is by registrable domain** (eTLD+1) using a compact
+  built-in suffix set, not the full Public Suffix List. It's correct for common
+  hosts (subdomains of your site count as first-party; `*.co.uk` etc. handled),
+  but exotic public suffixes may misclassify. The page's own domain (from
+  `page.url()`) is the first-party anchor; `data:` / `blob:` count as first-party.
+  Third-party **CPU** requires `PERF_TRACE=1` (the CPU profiler carries script URLs).
 
 ## Bench fixtures
 
@@ -290,6 +302,7 @@ regression fixture for the tool. `?fixed` (or `BENCH_FIXED=1`) toggles the fix.
 | chain | each request depends on the previous result | `network.waves` | 4 waves / 608 ms → 1 / 156 ms | combined endpoint |
 | huge-dom | rendering 30k list items | `render.nodes` | ~120k nodes / layout 100 ms → ~400 / fast | windowing / pagination |
 | paint | animating box-shadow every frame (no layout) | `render.paintCount` (PERF_TRACE) | 196 paints → 4 | animate `transform` (compositor-only) |
+| thirdparty | analytics / ad / tag-manager scripts from another origin | `network.thirdParty` (KB / reqs / CPU) | 4 reqs / 265 KB / 70 ms CPU → 0 | drop / defer / self-host the script |
 
 Notes worth internalizing:
 

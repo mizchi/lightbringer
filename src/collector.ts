@@ -75,6 +75,28 @@ export interface VitalSample {
   attribution: Record<string, unknown>;
 }
 
+/**
+ * Cost a span incurs from third-party origins (analytics, tag managers, ad
+ * tech, embedded widgets) — anything served from a registrable domain other
+ * than the page's own. This is the "weight emitted by non-application scripts":
+ * bytes the app didn't ship and network time it didn't ask for. CPU spent by
+ * third-party scripts is attributed separately by the drilldown (PERF_TRACE),
+ * which classifies CPU-profiler frames by their script URL host.
+ */
+export interface ThirdPartyBreakdown {
+  requestCount: number;
+  encodedKB: number;
+  /** wall time third-party requests kept the network busy (union of intervals, ms) */
+  busyMs: number;
+  /** per registrable-domain breakdown, heaviest first (by bytes) */
+  byDomain: Array<{
+    domain: string;
+    requestCount: number;
+    encodedKB: number;
+    busyMs: number;
+  }>;
+}
+
 /** Network breakdown of a span (network bottleneck analysis). */
 export interface SpanNetwork {
   requestCount: number;
@@ -83,6 +105,8 @@ export interface SpanNetwork {
   busyMs: number;
   /** Waterfall waves = approximate depth of serial dependency. 1 = one parallel wave. */
   waves: number;
+  /** subset of this span's network attributable to third-party origins */
+  thirdParty: ThirdPartyBreakdown;
   requests: Array<{
     url: string;
     type: string;
@@ -90,6 +114,8 @@ export interface SpanNetwork {
     startOffsetMs: number;
     durationMs: number;
     kb: number;
+    /** true if served from a registrable domain other than the page's */
+    thirdParty: boolean;
   }>;
 }
 
@@ -139,6 +165,10 @@ export interface Budget {
   busyMs?: number;
   layoutCount?: number;
   nodes?: number;
+  /** upper bound on bytes loaded from third-party origins */
+  thirdPartyKB?: number;
+  /** upper bound on request count to third-party origins */
+  thirdPartyRequestCount?: number;
   /** paint metrics are only present with PERF_TRACE=1; the gate is a no-op otherwise */
   paintMs?: number;
   paintCount?: number;
@@ -170,6 +200,8 @@ const BUDGET_METRIC: Record<keyof Budget, (s: SpanReport) => number> = {
   busyMs: (s) => s.network.busyMs,
   layoutCount: (s) => s.render.layoutCount,
   nodes: (s) => s.render.nodes,
+  thirdPartyKB: (s) => s.network.thirdParty.encodedKB,
+  thirdPartyRequestCount: (s) => s.network.thirdParty.requestCount,
   paintMs: (s) => s.render.paintMs ?? 0,
   paintCount: (s) => s.render.paintCount ?? 0,
 };
@@ -215,6 +247,8 @@ export interface NetworkReport {
   totalEncodedKB: number;
   byType: Record<string, { count: number; encodedKB: number }>;
   slowest: Array<{ url: string; type: string; durationMs: number; kb: number }>;
+  /** scenario-wide third-party total (bytes/requests the app didn't ship) */
+  thirdParty: ThirdPartyBreakdown;
 }
 
 /** Upper bounds on page-global web-vitals (gated on the median, like span budgets). */
@@ -592,6 +626,84 @@ function round(n: number): number {
   return Math.round(n * 10) / 10;
 }
 
+// First-party vs third-party classification by registrable domain.
+// Not a full Public Suffix List — a compact set of common multi-label suffixes
+// keeps "third party" honest on typical hosts without bundling the PSL. A
+// request is first-party when its registrable domain equals the page's.
+const MULTI_PART_SUFFIXES = new Set([
+  "co.uk", "gov.uk", "ac.uk", "org.uk", "co.jp", "ne.jp", "or.jp", "go.jp",
+  "ac.jp", "co.kr", "co.in", "co.nz", "co.za", "com.au", "com.br", "com.cn",
+  "com.tw", "com.hk", "com.sg", "com.mx",
+]);
+
+function hostOf(url: string): string | null {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return null; // data:, blob:, about: — treated as first-party (inline)
+  }
+}
+
+/** Registrable domain (eTLD+1), best-effort. IPs and bare hosts pass through. */
+function registrableDomain(host: string): string {
+  if (host.includes(":")) return host; // IPv6
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return host; // IPv4
+  const parts = host.split(".");
+  if (parts.length <= 2) return host;
+  const last2 = parts.slice(-2).join(".");
+  return MULTI_PART_SUFFIXES.has(last2) ? parts.slice(-3).join(".") : last2;
+}
+
+function isThirdParty(reqUrl: string, firstPartyDomain: string): boolean {
+  const h = hostOf(reqUrl);
+  if (!h || !firstPartyDomain) return false;
+  return registrableDomain(h) !== firstPartyDomain;
+}
+
+/** Aggregate the third-party slice of a set of network records. */
+function buildThirdParty(
+  records: Array<{ url: string; encodedKB: number; interval?: [number, number] }>,
+  firstPartyDomain: string,
+): ThirdPartyBreakdown {
+  const byDomain = new Map<
+    string,
+    { requestCount: number; encodedKB: number; intervals: Array<[number, number]> }
+  >();
+  const allIntervals: Array<[number, number]> = [];
+  let requestCount = 0;
+  let encodedKB = 0;
+  for (const r of records) {
+    if (!isThirdParty(r.url, firstPartyDomain)) continue;
+    const host = hostOf(r.url);
+    if (!host) continue;
+    const domain = registrableDomain(host);
+    const bucket =
+      byDomain.get(domain) ??
+      byDomain.set(domain, { requestCount: 0, encodedKB: 0, intervals: [] }).get(domain)!;
+    bucket.requestCount += 1;
+    bucket.encodedKB += r.encodedKB;
+    requestCount += 1;
+    encodedKB += r.encodedKB;
+    if (r.interval) {
+      bucket.intervals.push(r.interval);
+      allIntervals.push(r.interval);
+    }
+  }
+  return {
+    requestCount,
+    encodedKB: round(encodedKB),
+    busyMs: round(unionLength(allIntervals)),
+    byDomain: [...byDomain.entries()]
+      .map(([domain, v]) => ({
+        domain,
+        requestCount: v.requestCount,
+        encodedKB: round(v.encodedKB),
+        busyMs: round(unionLength(v.intervals)),
+      }))
+      .sort((a, b) => b.encodedKB - a.encodedKB),
+  };
+}
+
 /** Length of the union of intervals. Used for network busy time. */
 function unionLength(intervals: Array<[number, number]>): number {
   if (intervals.length === 0) return 0;
@@ -644,10 +756,18 @@ function pickAttribution(
   return out;
 }
 
-function buildGlobalNetwork(reqs: NetReq[]): NetworkReport {
+function buildGlobalNetwork(
+  reqs: NetReq[],
+  firstPartyDomain: string,
+): NetworkReport {
   const byType: NetworkReport["byType"] = {};
   let totalEncoded = 0;
   const finished: NetworkReport["slowest"] = [];
+  const tpRecords: Array<{
+    url: string;
+    encodedKB: number;
+    interval?: [number, number];
+  }> = [];
   for (const r of reqs) {
     const encoded = r.encoded ?? 0;
     totalEncoded += encoded;
@@ -662,6 +782,12 @@ function buildGlobalNetwork(reqs: NetReq[]): NetworkReport {
         kb: round(encoded / 1024),
       });
     }
+    tpRecords.push({
+      url: r.url,
+      encodedKB: encoded / 1024,
+      interval:
+        r.endEpochMs != null ? [r.startEpochMs, r.endEpochMs] : undefined,
+    });
   }
   for (const b of Object.values(byType)) b.encodedKB = round(b.encodedKB);
   finished.sort((a, b) => b.durationMs - a.durationMs);
@@ -670,6 +796,7 @@ function buildGlobalNetwork(reqs: NetReq[]): NetworkReport {
     totalEncodedKB: round(totalEncoded / 1024),
     byType,
     slowest: finished.slice(0, 8),
+    thirdParty: buildThirdParty(tpRecords, firstPartyDomain),
   };
 }
 
@@ -678,9 +805,18 @@ interface EpochWindow {
   endEpochMs: number;
 }
 
-function buildSpanNetwork(span: EpochWindow, reqs: NetReq[]): SpanNetwork {
+function buildSpanNetwork(
+  span: EpochWindow,
+  reqs: NetReq[],
+  firstPartyDomain: string,
+): SpanNetwork {
   const intervals: Array<[number, number]> = [];
   const requests: SpanNetwork["requests"] = [];
+  const tpRecords: Array<{
+    url: string;
+    encodedKB: number;
+    interval?: [number, number];
+  }> = [];
   let encoded = 0;
   for (const r of reqs) {
     const end = r.endEpochMs ?? r.startEpochMs;
@@ -688,14 +824,19 @@ function buildSpanNetwork(span: EpochWindow, reqs: NetReq[]): SpanNetwork {
     encoded += r.encoded ?? 0;
     const clipStart = Math.max(r.startEpochMs, span.startEpochMs);
     const clipEnd = Math.min(end, span.endEpochMs);
-    if (clipEnd > clipStart) intervals.push([clipStart, clipEnd]);
+    const interval: [number, number] | undefined =
+      clipEnd > clipStart ? [clipStart, clipEnd] : undefined;
+    if (interval) intervals.push(interval);
+    const tp = isThirdParty(r.url, firstPartyDomain);
     requests.push({
       url: r.url,
       type: r.type,
       startOffsetMs: round(r.startEpochMs - span.startEpochMs),
       durationMs: round(end - r.startEpochMs),
       kb: round((r.encoded ?? 0) / 1024),
+      thirdParty: tp,
     });
+    tpRecords.push({ url: r.url, encodedKB: (r.encoded ?? 0) / 1024, interval });
   }
   requests.sort((a, b) => b.durationMs - a.durationMs);
   return {
@@ -703,6 +844,7 @@ function buildSpanNetwork(span: EpochWindow, reqs: NetReq[]): SpanNetwork {
     encodedKB: round(encoded / 1024),
     busyMs: round(unionLength(intervals)),
     waves: countWaves(intervals),
+    thirdParty: buildThirdParty(tpRecords, firstPartyDomain),
     requests,
   };
 }
@@ -789,6 +931,11 @@ function buildReport(
   reqs: NetReq[],
   traceEvents?: TraceEvent[],
 ): PerfReport {
+  // The page's own registrable domain anchors first- vs third-party. Falls back
+  // to "" (everything counts as first-party) when the URL has no host.
+  const pageHost = hostOf(url);
+  const firstPartyDomain = pageHost ? registrableDomain(pageHost) : "";
+
   const vitals: Record<string, VitalSample> = {};
   for (const [name, m] of Object.entries(raw.vitals)) {
     vitals[name] = {
@@ -819,7 +966,7 @@ function buildReport(
       name: s.name,
       durationMs: round(s.endEpochMs - s.startEpochMs),
       capped: s.capped,
-      network: buildSpanNetwork(s, reqs),
+      network: buildSpanNetwork(s, reqs, firstPartyDomain),
       cpu: buildSpanCpu(s, longTasks, loaf),
       render,
       traceWindowUs: [s.traceStartUs, s.traceEndUs],
@@ -843,7 +990,7 @@ function buildReport(
       };
       return {
         ...s,
-        network: buildSpanNetwork(win, reqs),
+        network: buildSpanNetwork(win, reqs, firstPartyDomain),
         cpu: buildSpanCpu(win, longTasks, loaf),
       };
     },
@@ -855,7 +1002,7 @@ function buildReport(
     vitals,
     spans: spanReports,
     appSpans,
-    network: buildGlobalNetwork(reqs),
+    network: buildGlobalNetwork(reqs, firstPartyDomain),
   };
 }
 
@@ -878,6 +1025,16 @@ function logSummary(report: PerfReport): void {
       `      net   busy=${s.network.busyMs}ms  ${s.network.requestCount}reqs  ${s.network.waves}waves  ${s.network.encodedKB}KB` +
         (saturated ? "  (net-saturated: busyMs ≈ window)" : ""),
     );
+    const tp = s.network.thirdParty;
+    if (tp.requestCount > 0) {
+      const top = tp.byDomain
+        .slice(0, 3)
+        .map((d) => `${d.domain} ${d.encodedKB}KB`)
+        .join(", ");
+      lines.push(
+        `      3p    ${tp.requestCount}reqs  ${tp.encodedKB}KB  busy=${tp.busyMs}ms  [${top}]`,
+      );
+    }
     lines.push(
       `      cpu   block=${s.cpu.blockingMs}ms  longtasks=${s.cpu.longTaskCount}` +
         `  maxTask=${s.cpu.maxLongTaskMs}ms  loaf=${s.cpu.loafCount}/${s.cpu.maxLoafBlockingMs}ms`,
@@ -910,6 +1067,16 @@ function logSummary(report: PerfReport): void {
   lines.push(
     `  total network ${report.network.totalRequests} reqs / ${report.network.totalEncodedKB}KB`,
   );
+  const gtp = report.network.thirdParty;
+  if (gtp.requestCount > 0) {
+    const share = report.network.totalEncodedKB
+      ? Math.round((gtp.encodedKB / report.network.totalEncodedKB) * 100)
+      : 0;
+    lines.push(
+      `    third-party ${gtp.requestCount} reqs / ${gtp.encodedKB}KB (${share}% of bytes)` +
+        ` across ${gtp.byDomain.length} domains`,
+    );
+  }
   const violations = checkBudgets(report);
   for (const v of violations) {
     lines.push(`  ! budget: ${v}`);

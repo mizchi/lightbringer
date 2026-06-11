@@ -7,6 +7,7 @@ export default defineConfig({
   test: {
     includeSource: ["src/otel.ts", "src/trace.ts"],
     // examples/*.spec.ts are Playwright tests; keep the vitest runner out of them.
-    exclude: ["**/node_modules/**", "**/dist/**", "examples/**"],
+    // .direnv holds a Nix-materialized copy of the repo (incl. examples) — exclude it too.
+    exclude: ["**/node_modules/**", "**/dist/**", "**/.direnv/**", "examples/**"],
   },
 });
