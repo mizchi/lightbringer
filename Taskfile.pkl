@@ -8,7 +8,9 @@ local sources: Listing<String> = new {
 
 local typecheck: Task = new {
   name = "typecheck"
-  cmd = "tsc --noEmit"
+  // pnpm exec resolves the local binary; the git pre-push hook runs without
+  // direnv, so node_modules/.bin is not on PATH and bare `tsc` is not found.
+  cmd = "pnpm exec tsc --noEmit"
   inputs {
     ...sources
     "tsconfig.json"
@@ -17,13 +19,13 @@ local typecheck: Task = new {
 
 local testUnit: Task = new {
   name = "test:unit"
-  cmd = "vitest run"
+  cmd = "pnpm exec vitest run"
   inputs = sources
 }
 
 local lint: Task = new {
   name = "lint"
-  cmd = "oxlint"
+  cmd = "pnpm exec oxlint"
   inputs = sources
 }
 
@@ -38,6 +40,8 @@ local secretlint: Task = new {
 local prePush: Task = new {
   name = "pre-push"
   cache = false
+  // git's pre-push hook passes <remote> <url> positionally; accept and ignore them.
+  acceptsArgs = true
   deps {
     secretlint
     typecheck
