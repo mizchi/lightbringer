@@ -293,7 +293,8 @@ function Cls({ fixed }: { fixed: boolean }) {
 // app didn't ship — extra bytes, network time, and CPU. fixed loads none. The
 // cost surfaces under network.thirdParty (and the drilldown's third-party self
 // time), separated from first-party app code.
-const TP = "http://127.0.0.1:5173/3p"; // cross-origin to the page (localhost)
+// cross-origin to the page (127.0.0.1 vs localhost), on whatever port vite uses
+const TP = `http://127.0.0.1:${location.port || "5173"}/3p`;
 function loadScript(src: string): Promise<void> {
   return new Promise((resolve) => {
     const el = document.createElement("script");
@@ -356,6 +357,50 @@ function Stress({ fixed }: { fixed: boolean }) {
         load
       </button>
       <div id="status">{status}</div>
+    </main>
+  );
+}
+
+// Scenario 13: memory leak. slow retains, on every click, ~200k on-heap objects
+// plus live ArrayBuffers plus detached DOM nodes each carrying an event listener,
+// in a module-level cache that never evicts — so JS heap (on-heap), the
+// ArrayBuffer count, and the listener count climb step over step (the per-step
+// leak shape). fixed does the identical allocation but keeps nothing and unbinds
+// the listeners, so the deltas fall back to ~0. Lights up memory.jsHeapDeltaMB /
+// arrayBuffers / listenersDelta. Note: this measures per-step memory *load*, not
+// which object retains what (heap-snapshot retained-graph analysis is out of
+// scope). Off-heap buffer *bytes* aren't observable via CDP getMetrics — only the
+// ArrayBuffer count is, so binary/GPU-staging memory shows as a climbing count.
+const leakStore: unknown[] = [];
+function Leak({ fixed }: { fixed: boolean }) {
+  const [n, setN] = useState(0);
+  const run = () => {
+    // on-heap retained objects move JSHeapUsedSize (typed-array bytes would not).
+    const objects = Array.from({ length: 200_000 }, (_, i) => ({
+      i,
+      s: `leak#${i}`,
+    }));
+    // live ArrayBuffers move the ArrayBuffer count (the buffer-memory proxy).
+    const buffers = Array.from({ length: 30 }, () => new ArrayBuffer(64 * 1024));
+    const nodes: HTMLElement[] = [];
+    for (let i = 0; i < 20; i++) {
+      const node = document.createElement("div"); // detached (never appended)
+      const handler = () => objects.length;
+      node.addEventListener("click", handler);
+      if (fixed) node.removeEventListener("click", handler);
+      nodes.push(node);
+    }
+    // slow: retain everything forever. fixed: drop it all (listeners already unbound).
+    if (!fixed) leakStore.push({ objects, buffers, nodes });
+    setN((v) => v + 1);
+  };
+  return (
+    <main>
+      <h1>leak {fixed ? "(fixed)" : "(slow)"}</h1>
+      <button id="alloc" type="button" onClick={run}>
+        alloc
+      </button>
+      <span id="count">{n}</span>
     </main>
   );
 }
@@ -464,6 +509,8 @@ export function App() {
       return <ThirdParty fixed={fixed} />;
     case "stress":
       return <Stress fixed={fixed} />;
+    case "leak":
+      return <Leak fixed={fixed} />;
     default:
       return <Rerender fixed={fixed} />;
   }

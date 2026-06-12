@@ -12,10 +12,12 @@ not how the test waits.
 Lighthouse only measures the initial load; lightbringer covers the whole scenario
 lifecycle, step by step.
 
-**In scope:** per-step network / CPU / render / INP of one scenario, a median gate
-for regressions, and a trace drilldown to the responsible code.
+**In scope:** per-step network / CPU / render / INP / memory load of one scenario,
+a median gate for regressions, and a trace drilldown to the responsible code.
 **Out of scope (non-goals):** a general always-on profiler, cross-scenario / whole-
-suite analysis, and memory / leak detection.
+suite analysis, and heap-snapshot leak analysis (the retained-object graph — which
+object holds what). Memory is measured as a per-step *load* (heap / buffer / DOM /
+listener gauges and their per-step delta), not as a retained-graph diff.
 
 ```
 [perf] measure initial load and a follow-up navigation
@@ -24,6 +26,7 @@ suite analysis, and memory / leak detection.
       net   busy=160ms  18reqs  7waves  680KB
       cpu   block=52ms  longtasks=1  maxTask=52ms  loaf=1/0ms
       render style=7/4.5ms  layout=7/8.9ms  script=56ms  paint=8/1.7ms  gpu=6ms
+      mem   heap=12.4MB (+2.1MB)  arraybufs=3  listeners=84 (+6)  docs=+0  domNodes=512
   app-work                       22ms
       ...
   app spans (performance.measure):
@@ -47,7 +50,18 @@ Per **span** (one `perf.measure(name, action)` region):
 - **cpu** — long task count, total blocking time, heaviest long task, LoAF.
 - **render** — style recalc / layout count and time (from CDP
   `Performance.getMetrics` cumulative counters), JS execution time; and, with
-  `PERF_TRACE=1`, Paint count/time and GPU task time from the trace.
+  `PERF_TRACE=1`, Paint count/time and **GPU task time** (`gpuMs`) from the trace.
+  The drilldown rolls GPU work up per type (GPUTask / RasterTask / …) so a step
+  that's cheap on the main thread but GPU-bound is visible.
+- **memory** — per-step memory *load* from `Performance.getMetrics` gauges:
+  on-heap JS used + delta (`jsHeapUsedMB` / `jsHeapDeltaMB`), live ArrayBuffer
+  count, retained DOM nodes, event-listener count + delta, and document delta. A
+  delta that stays positive across repeated runs of the same step is the leak
+  signal. Counts (listeners / ArrayBuffers / documents) are the reliable signals;
+  heap bytes are noisy unless you force a GC with **`PERF_MEM=1`** (which measures
+  the deltas after `HeapProfiler.collectGarbage`, i.e. retained memory only). Note
+  byte-level buffer / GPU memory is not observable via CDP — only the ArrayBuffer
+  *count* is, so binary / GPU-staging memory shows as a climbing count, not bytes.
 
 All times are unified to epoch ms so spans correlate with network / CPU even
 across navigations.
@@ -86,8 +100,10 @@ covers "until the operation is done".
 
 ```sh
 pnpm exec playwright test                       # measure
-PERF_TRACE=1 pnpm exec playwright test          # also save a Chrome trace
+PERF_TRACE=1 pnpm exec playwright test          # also save a Chrome trace (Paint / GPU / drilldown)
 PERF_CPU=4 pnpm exec playwright test            # throttle CPU 4x (mid-tier device)
+PERF_GPU=1 pnpm exec playwright test            # hardware GL (real GPU/paint numbers)
+PERF_MEM=1 pnpm exec playwright test            # force GC at span boundaries (retained-only memory deltas)
 pnpm exec playwright test --repeat-each=5        # multiple runs for median
 node node_modules/lightbringer/scripts/median.mjs
 ```
@@ -205,9 +221,11 @@ Either way, violations are also printed in the per-run summary (`! budget: ...`)
 
 Span budget fields: `durationMs`, `scriptMs`, `blockingMs`, `encodedKB`,
 `requestCount`, `waves`, `busyMs`, `thirdPartyKB`, `thirdPartyRequestCount`,
-`layoutCount`, `nodes`, `paintCount` /
-`paintMs` (PERF_TRACE only). For page-global
-web-vitals, declare a separate budget once per test:
+`layoutCount`, `nodes`, `jsHeapUsedMB`, `jsHeapDeltaMB`, `listenersDelta`,
+`paintCount` / `paintMs` / `gpuMs` (PERF_TRACE only). The memory bounds
+(`jsHeapDeltaMB` especially) are only trustworthy under `PERF_MEM=1`; prefer the
+count-based `listenersDelta` for a GC-stable gate. For page-global web-vitals,
+declare a separate budget once per test:
 
 ```ts
 perf.setVitalsBudget({ LCP: 2500, INP: 200, CLS: 0.1 });
@@ -283,6 +301,20 @@ Things that bite, learned from the accuracy probe:
   but exotic public suffixes may misclassify. The page's own domain (from
   `page.url()`) is the first-party anchor; `data:` / `blob:` count as first-party.
   Third-party **CPU** requires `PERF_TRACE=1` (the CPU profiler carries script URLs).
+- **Memory deltas need a GC to be trustworthy.** Without `PERF_MEM=1` a span's
+  `jsHeapDeltaMB` includes the step's own not-yet-collected garbage, so a fixed
+  (non-leaking) step looks the same as a leaking one. `PERF_MEM=1` forces
+  `HeapProfiler.collectGarbage` at both span boundaries so the delta is
+  retained-only — but the GC adds wall time to the span, so it's opt-in and you
+  shouldn't read `durationMs` from a `PERF_MEM` run. Even then, on-heap objects can
+  survive a single step's GC, so `jsHeapDeltaMB` is directional; the **counts**
+  (`listenersDelta`, ArrayBuffer count, document delta) are the reliable per-run
+  leak signals. `JSHeapUsedSize` excludes off-heap buffer bytes (typed arrays /
+  wasm / GPU staging), which is why a leaked 8 MB `Float64Array` shows only as the
+  ArrayBuffer count going up, not as heap MB.
+- **`PERF_PORT` overrides the fixture dev-server port** (default 5173). Set it to a
+  free port when another Vite project is already on 5173 — otherwise Playwright
+  reuses that server and silently measures the wrong app.
 
 ## Bench fixtures
 
@@ -313,6 +345,7 @@ regression fixture for the tool. `?fixed` (or `BENCH_FIXED=1`) toggles the fix.
 | huge-dom | rendering 30k list items | `render.nodes` | ~120k nodes / layout 100 ms → ~400 / fast | windowing / pagination |
 | paint | animating box-shadow every frame (no layout) | `render.paintCount` (PERF_TRACE) | 196 paints → 4 | animate `transform` (compositor-only) |
 | thirdparty | analytics / ad / tag-manager scripts from another origin | `network.thirdParty` (KB / reqs / CPU) | 4 reqs / 265 KB / 70 ms CPU → 0 | drop / defer / self-host the script |
+| leak | each click retains objects / buffers / listeners forever | `memory.listenersDelta` / `arrayBuffers` (PERF_MEM) | +19 listeners / +30 buffers → ~0 | drop refs, unbind listeners |
 
 `stress` is different: it doesn't measure an app bottleneck, it stresses
 lightbringer's own data handling — 600 concurrent requests + a 150k-mark trace

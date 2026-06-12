@@ -89,6 +89,18 @@ function aggregateSlug(slug, runs) {
       render.paintMs = statBy(items, (s) => s.render?.paintMs ?? 0);
       render.gpuMs = statBy(items, (s) => s.render?.gpuMs ?? 0);
     }
+    const hasMemory = items.some((s) => s.memory !== undefined);
+    const memory = hasMemory
+      ? {
+          jsHeapUsedMB: statBy(items, (s) => s.memory?.jsHeapUsedMB ?? 0),
+          jsHeapDeltaMB: statBy(items, (s) => s.memory?.jsHeapDeltaMB ?? 0),
+          arrayBuffers: statBy(items, (s) => s.memory?.arrayBuffers ?? 0),
+          domNodes: statBy(items, (s) => s.memory?.domNodes ?? 0),
+          jsEventListeners: statBy(items, (s) => s.memory?.jsEventListeners ?? 0),
+          listenersDelta: statBy(items, (s) => s.memory?.listenersDelta ?? 0),
+          documentsDelta: statBy(items, (s) => s.memory?.documentsDelta ?? 0),
+        }
+      : undefined;
     return {
       name,
       durationMs: statBy(items, (s) => s.durationMs),
@@ -108,6 +120,7 @@ function aggregateSlug(slug, runs) {
         maxLongTaskMs: statBy(items, (s) => s.cpu.maxLongTaskMs),
       },
       render,
+      memory,
       budget,
     };
   });
@@ -153,6 +166,10 @@ const STAT_OF = {
   nodes: (s) => s.render.nodes,
   paintMs: (s) => s.render.paintMs, // only present with PERF_TRACE
   paintCount: (s) => s.render.paintCount,
+  gpuMs: (s) => s.render.gpuMs, // only present with PERF_TRACE
+  jsHeapUsedMB: (s) => s.memory?.jsHeapUsedMB,
+  jsHeapDeltaMB: (s) => s.memory?.jsHeapDeltaMB,
+  listenersDelta: (s) => s.memory?.listenersDelta,
 };
 
 /**
@@ -225,6 +242,12 @@ function printSummary(agg) {
     lines.push(
       `      render style=${fmt(r.recalcStyleCount)}/${fmt(r.recalcStyleMs)}ms  layout=${fmt(r.layoutCount)}/${fmt(r.layoutMs)}ms  nodes=${fmt(r.nodes)}  script=${fmt(r.scriptMs)}ms${paint}`,
     );
+    if (s.memory) {
+      const m = s.memory;
+      lines.push(
+        `      mem    heap=${fmt(m.jsHeapUsedMB)}MB  Δheap=${fmt(m.jsHeapDeltaMB)}MB  arraybufs=${fmt(m.arrayBuffers)}  listeners=${fmt(m.jsEventListeners)} (Δ${fmt(m.listenersDelta)})`,
+      );
+    }
   }
   if (agg.appSpans.length) {
     lines.push("  app spans (performance.measure):");

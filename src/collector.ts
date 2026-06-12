@@ -48,6 +48,14 @@ const TRACE_ENABLED = process.env.PERF_TRACE === "1";
 /** PERF_CPU=N throttles the CPU N times (mid-tier device emulation). 1 = off. */
 const CPU_RATE = Number(process.env.PERF_CPU ?? "1");
 
+/**
+ * PERF_MEM=1 forces a GC (HeapProfiler.collectGarbage) at each span boundary so
+ * the memory deltas reflect *retained* memory — the leak signal — instead of
+ * not-yet-collected garbage from the step itself. Off by default because the GC
+ * adds wall time to the span (it would distort durationMs / settle timing).
+ */
+const MEM_GC = process.env.PERF_MEM === "1";
+
 /** Max time to wait for settle before marking a span capped (ms). */
 const SETTLE_TIMEOUT_MS = Number(process.env.PERF_SETTLE_TIMEOUT ?? "5000");
 
@@ -151,6 +159,40 @@ export interface SpanRender {
 }
 
 /**
+ * Memory load a span incurs, from CDP Performance.getMetrics gauges (always on,
+ * no trace needed). This is per-step memory *load* — how much a step grows the JS
+ * heap and what it retains (DOM / listeners / documents) — in the same
+ * "resource consumed per step" model as cpu / network / render. It is NOT
+ * heap-snapshot leak detection: the retained-object graph (which object holds
+ * what) is out of scope. The leak *signal* here is a delta that stays positive
+ * across repeated runs of the same step (heap / listeners / documents climbing).
+ *
+ * Byte-level binary / GPU memory is NOT available here: CDP getMetrics has no
+ * byte counter for off-heap memory (only disabled-by-default-memory-infra trace
+ * dumps do, which are heavy and unreliable headless), and JSHeapUsedSize counts
+ * only on-heap JS objects — an ArrayBuffer / typed-array / wasm backing store is
+ * off-heap and does NOT move it. The closest available proxy for buffer memory is
+ * arrayBuffers, a *count* of live ArrayBuffers (climbing ⇒ buffers being retained,
+ * e.g. GPU textures / staging buffers / wasm), not their byte size.
+ */
+export interface SpanMemory {
+  /** on-heap JS in use at span end (MB, absolute; excludes off-heap buffer backing stores) */
+  jsHeapUsedMB: number;
+  /** on-heap JS growth during the span (MB; sustained positive across repeats ⇒ leak) */
+  jsHeapDeltaMB: number;
+  /** count of live ArrayBuffers at span end (NOT bytes; a climbing count ⇒ buffer leak) */
+  arrayBuffers: number;
+  /** total DOM nodes retained at span end (absolute; the DOM size, not the delta) */
+  domNodes: number;
+  /** event listeners retained at span end (absolute; climbing every step ⇒ listener leak) */
+  jsEventListeners: number;
+  /** net event listeners added during the span */
+  listenersDelta: number;
+  /** net documents added during the span (climbing ⇒ detached-document leak) */
+  documentsDelta: number;
+}
+
+/**
  * Per-span budget. Each field is an upper bound; the median gate (and optional
  * inline assert) fails when the measured value exceeds it. scriptMs is the most
  * reliable bound (±1ms); duration/blocking are noisier — gate them on the median.
@@ -172,6 +214,14 @@ export interface Budget {
   /** paint metrics are only present with PERF_TRACE=1; the gate is a no-op otherwise */
   paintMs?: number;
   paintCount?: number;
+  /** GPU task time (ms); only present with PERF_TRACE=1, gate is a no-op otherwise */
+  gpuMs?: number;
+  /** upper bound on JS heap in use at span end (MB) */
+  jsHeapUsedMB?: number;
+  /** upper bound on JS heap growth during the span (MB) — catches per-step leaks */
+  jsHeapDeltaMB?: number;
+  /** upper bound on net event listeners added during the span — catches listener leaks */
+  listenersDelta?: number;
 }
 
 export interface SpanReport {
@@ -183,6 +233,7 @@ export interface SpanReport {
   network: SpanNetwork;
   cpu: SpanCpu;
   render: SpanRender;
+  memory: SpanMemory;
   /** span window in trace clock (monotonic μs). Used by the drilldown script. */
   traceWindowUs: [number, number];
   /** declared budget, if any (carried into the report so the median gate can read it) */
@@ -204,6 +255,10 @@ const BUDGET_METRIC: Record<keyof Budget, (s: SpanReport) => number> = {
   thirdPartyRequestCount: (s) => s.network.thirdParty.requestCount,
   paintMs: (s) => s.render.paintMs ?? 0,
   paintCount: (s) => s.render.paintCount ?? 0,
+  gpuMs: (s) => s.render.gpuMs ?? 0,
+  jsHeapUsedMB: (s) => s.memory.jsHeapUsedMB,
+  jsHeapDeltaMB: (s) => s.memory.jsHeapDeltaMB,
+  listenersDelta: (s) => s.memory.listenersDelta,
 };
 
 /** Budget violations on a single run (actual > budget). */
@@ -431,6 +486,7 @@ interface RawSpan {
   endEpochMs: number;
   capped: boolean;
   render: SpanRender;
+  memory: SpanMemory;
   /** span window in trace clock (monotonic μs) for correlation / drilldown */
   traceStartUs: number;
   traceEndUs: number;
@@ -450,6 +506,26 @@ function diffMetrics(
     layoutMs: round(d("LayoutDuration") * 1000),
     nodes: d("Nodes"),
     scriptMs: round(d("ScriptDuration") * 1000),
+  };
+}
+
+const BYTES_PER_MB = 1024 * 1024;
+
+/** CDP Performance.getMetrics memory gauges -> per-step memory load. */
+function diffMemory(
+  before: Record<string, number>,
+  after: Record<string, number>,
+): SpanMemory {
+  const d = (k: string) => (after[k] ?? 0) - (before[k] ?? 0);
+  const a = (k: string) => after[k] ?? 0;
+  return {
+    jsHeapUsedMB: round(a("JSHeapUsedSize") / BYTES_PER_MB),
+    jsHeapDeltaMB: round(d("JSHeapUsedSize") / BYTES_PER_MB),
+    arrayBuffers: a("ArrayBufferContents"),
+    domNodes: a("Nodes"),
+    jsEventListeners: a("JSEventListeners"),
+    listenersDelta: d("JSEventListeners"),
+    documentsDelta: d("Documents"),
   };
 }
 
@@ -479,17 +555,27 @@ export class PerfController {
     opts: { settle?: Settle; budget?: Budget } = {},
   ): Promise<void> {
     const startEpochMs = await this.now();
+    // With PERF_MEM, GC before the baseline so the delta starts from a clean heap.
+    if (MEM_GC) await this.gc();
     const before = await this.metrics();
     await action();
     const capped = await this.runSettle(opts.settle ?? this.settle);
     const endEpochMs = await this.now();
     const after = await this.metrics();
+    // Memory uses a post-GC end snapshot under PERF_MEM (retained-only); render and
+    // timing keep the un-GC'd `after` so the GC pause doesn't distort them.
+    let memAfter = after;
+    if (MEM_GC) {
+      await this.gc();
+      memAfter = await this.metrics();
+    }
     this.spans.push({
       name,
       startEpochMs,
       endEpochMs,
       capped,
       render: diffMetrics(before, after),
+      memory: diffMemory(before, memAfter),
       // getMetrics Timestamp (monotonic seconds) shares the clock with trace ts (μs).
       traceStartUs: (before.Timestamp ?? 0) * 1e6,
       traceEndUs: (after.Timestamp ?? 0) * 1e6,
@@ -511,6 +597,14 @@ export class PerfController {
 
   private now(): Promise<number> {
     return this.page.evaluate(() => performance.timeOrigin + performance.now());
+  }
+
+  /** Force a GC so subsequent memory metrics reflect retained, not pending-collection, memory. */
+  private async gc(): Promise<void> {
+    // Twice: one collectGarbage leaves recently-promoted objects uncollected, so a
+    // dropped allocation can still inflate JSHeapUsedSize after a single pass.
+    await this.client.send("HeapProfiler.collectGarbage").catch(() => {});
+    await this.client.send("HeapProfiler.collectGarbage").catch(() => {});
   }
 
   private async metrics(): Promise<Record<string, number>> {
@@ -1008,6 +1102,7 @@ function buildReport(
       network: buildSpanNetwork(s, reqs, firstPartyDomain),
       cpu: buildSpanCpu(s, longTasks, loaf),
       render,
+      memory: s.memory,
       traceWindowUs: [s.traceStartUs, s.traceEndUs],
       budget: s.budget,
     };
@@ -1086,6 +1181,19 @@ function logSummary(report: PerfReport): void {
     lines.push(
       `      render style=${r.recalcStyleCount}/${r.recalcStyleMs}ms` +
         `  layout=${r.layoutCount}/${r.layoutMs}ms  nodes=${r.nodes}  script=${r.scriptMs}ms${paint}`,
+    );
+    const m = s.memory;
+    const sign = (n: number) => (n >= 0 ? `+${n}` : `${n}`);
+    // Under PERF_MEM the deltas are post-GC (retained only); a step that retains
+    // both heap and listeners is the per-step leak shape. Without GC the deltas
+    // include the step's own uncollected garbage, so the hint would be noise.
+    const leakish = MEM_GC && m.jsHeapDeltaMB > 0 && m.listenersDelta > 0;
+    lines.push(
+      `      mem   heap=${m.jsHeapUsedMB}MB (${sign(m.jsHeapDeltaMB)}MB)` +
+        `  arraybufs=${m.arrayBuffers}  listeners=${m.jsEventListeners} (${sign(m.listenersDelta)})` +
+        `  docs=${sign(m.documentsDelta)}  domNodes=${m.domNodes}` +
+        (MEM_GC ? "" : "  (pre-GC; set PERF_MEM=1 for retained-only deltas)") +
+        (leakish ? "  (retained heap+listeners grew — likely leak)" : ""),
     );
   }
   if (report.appSpans.length > 0) {

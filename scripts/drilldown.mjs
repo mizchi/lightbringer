@@ -284,3 +284,40 @@ if (domainRanked.length > 0) {
     console.log(`    ${String(r.selfMs).padStart(8)}ms  ${r.domain}`);
   }
 }
+
+// --- GPU rendering load (GPU process, not the main thread) ---
+// GPUTask events are the GPU process's work units; raster / image-decode / paint
+// run there off the main thread, so a span can be cheap on CPU yet GPU-bound.
+// These come from the `gpu` + devtools.timeline.frame trace categories.
+const GPU_NAMES = new Set([
+  "GPUTask",
+  "RasterTask",
+  "ImageDecodeTask",
+  "Rasterize",
+  "RasterFinishedTask",
+]);
+const byGpu = new Map();
+let gpuTotal = 0;
+for (const e of inWindow) {
+  if (!e.name || e.dur == null || !GPU_NAMES.has(e.name)) continue;
+  const cur = byGpu.get(e.name) ?? { totalMs: 0, count: 0 };
+  cur.totalMs += e.dur / 1000;
+  cur.count += 1;
+  byGpu.set(e.name, cur);
+  if (e.name === "GPUTask") gpuTotal += e.dur / 1000;
+}
+const gpuRanked = [...byGpu.entries()]
+  .map(([name, v]) => ({ name, totalMs: round(v.totalMs), count: v.count }))
+  .sort((a, b) => b.totalMs - a.totalMs);
+console.log(
+  `\n  GPU rendering load (GPU process):  GPUTask total ${round(gpuTotal)}ms` +
+    `  (render.gpu=${span.render?.gpuMs ?? "n/a"}ms)`,
+);
+if (gpuRanked.length === 0) {
+  console.log(
+    "    no GPU events in window (software GL / SwiftShader emits none — use PERF_GPU=1)",
+  );
+}
+for (const r of gpuRanked) {
+  console.log(`    ${String(r.totalMs).padStart(8)}ms x${r.count}  ${r.name}`);
+}
