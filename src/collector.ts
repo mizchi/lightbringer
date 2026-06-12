@@ -169,6 +169,28 @@ export interface SpanNetwork {
   }>;
 }
 
+/**
+ * Responsiveness of the interactions inside a span (per-step INP). web-vitals
+ * reports one page-global worst INP; this attributes the worst interaction to the
+ * span it happened in and breaks it into the three INP phases, so you can see
+ * which step is janky and why. Sourced from the Event Timing API
+ * (interactionId > 0 entries). Undefined for spans with no interaction.
+ */
+export interface SpanInteraction {
+  /** interactions (interactionId>0 event-timing entries) in the span */
+  count: number;
+  /** worst interaction's total latency (input → next paint), ms — the span's INP */
+  maxDurationMs: number;
+  /** event type of the worst interaction (click / keydown / pointerup / …) */
+  type: string;
+  /** time before the handler ran (main thread busy) */
+  inputDelayMs: number;
+  /** time spent in the event handlers */
+  processingMs: number;
+  /** time from handlers done to the next paint */
+  presentationMs: number;
+}
+
 /** CPU breakdown of a span (CPU bottleneck analysis). */
 export interface SpanCpu {
   longTaskCount: number;
@@ -268,6 +290,8 @@ export interface Budget {
   jsHeapDeltaMB?: number;
   /** upper bound on net event listeners added during the span — catches listener leaks */
   listenersDelta?: number;
+  /** upper bound on the worst interaction latency in the span (per-step INP, ms) */
+  interactionMs?: number;
 }
 
 export interface SpanReport {
@@ -280,6 +304,8 @@ export interface SpanReport {
   cpu: SpanCpu;
   render: SpanRender;
   memory: SpanMemory;
+  /** responsiveness of interactions in the span (per-step INP); absent if none */
+  interaction?: SpanInteraction;
   /** span window in trace clock (monotonic μs). Used by the drilldown script. */
   traceWindowUs: [number, number];
   /** declared budget, if any (carried into the report so the median gate can read it) */
@@ -307,6 +333,7 @@ const BUDGET_METRIC: Record<keyof Budget, (s: SpanReport) => number> = {
   jsHeapUsedMB: (s) => s.memory.jsHeapUsedMB,
   jsHeapDeltaMB: (s) => s.memory.jsHeapDeltaMB,
   listenersDelta: (s) => s.memory.listenersDelta,
+  interactionMs: (s) => s.interaction?.maxDurationMs ?? 0,
 };
 
 /** Budget violations on a single run (actual > budget). */
@@ -406,6 +433,8 @@ export interface PerfReport {
   css?: CssProfile;
   /** JS/CSS coverage across the scenario (PERF_COV=1) — chunk usage / dead code */
   coverage?: Coverage;
+  /** image over-fetch + uncompressed-resource analysis */
+  media?: MediaReport;
   /** WebGL renderer string; "SwiftShader" means software GL (GPU numbers are fake) */
   glRenderer?: string;
   /** uncaught page errors during measurement; non-empty means results are suspect */
@@ -456,6 +485,28 @@ export interface Coverage {
   css: CoverageReport;
 }
 
+/**
+ * Image / media weight. Two wins that a byte count alone misses: images shipped
+ * far larger than they're displayed (over-fetch — a 2000px image in a 256px box),
+ * and large text resources served with little/no compression. From Resource
+ * Timing (encoded/decoded sizes) + DOM intrinsic-vs-rendered dimensions.
+ */
+export interface MediaReport {
+  imageCount: number;
+  imageKB: number;
+  /** images whose intrinsic pixels far exceed their rendered (CSS×DPR) pixels */
+  oversized: Array<{
+    url: string;
+    naturalPx: string;
+    renderedPx: string;
+    /** intrinsic area / rendered area (≥4 means ≥2× too big per dimension) */
+    overFetch: number;
+    kb: number;
+  }>;
+  /** large compressible resources shipped ~uncompressed (decoded ≈ encoded) */
+  uncompressed: Array<{ url: string; kb: number; ratio: number; type: string }>;
+}
+
 /** Strategy that waits until the page has settled after an action. */
 export type Settle = (page: Page) => Promise<void>;
 
@@ -500,6 +551,14 @@ interface PerfWindow {
       duration: number;
       detail: unknown;
     }>;
+    /** Event Timing entries for real interactions (interactionId > 0) */
+    events: Array<{
+      start: number;
+      duration: number;
+      type: string;
+      processingStart: number;
+      processingEnd: number;
+    }>;
     /** drain pending PerformanceObserver records into the store (see flush below) */
     flush?: () => void;
   };
@@ -507,7 +566,7 @@ interface PerfWindow {
 
 function browserCollector() {
   const w = window as unknown as PerfWindow;
-  w.__perf = { vitals: {}, longTasks: [], loaf: [], measures: [] };
+  w.__perf = { vitals: {}, longTasks: [], loaf: [], measures: [], events: [] };
   const store = w.__perf;
 
   const record = (m: BrowserMetric) => {
@@ -563,6 +622,28 @@ function browserCollector() {
     }
   };
 
+  // Event Timing: only interactionId>0 entries are real interactions (click,
+  // keydown, pointerup, …). duration is input→next-paint (8ms-bucketed); split
+  // into input delay / processing / presentation at aggregation.
+  type EventTimingLike = PerformanceEntry & {
+    processingStart: number;
+    processingEnd: number;
+    interactionId?: number;
+  };
+  const drainEvent = (entries: PerformanceEntryList) => {
+    for (const e of entries) {
+      const pe = e as EventTimingLike;
+      if (!pe.interactionId) continue;
+      store.events.push({
+        start: pe.startTime,
+        duration: pe.duration,
+        type: pe.name,
+        processingStart: pe.processingStart,
+        processingEnd: pe.processingEnd,
+      });
+    }
+  };
+
   const observers: PerformanceObserver[] = [];
   const observe = (
     drain: (e: PerformanceEntryList) => void,
@@ -583,6 +664,11 @@ function browserCollector() {
     buffered: true,
   } as PerformanceObserverInit);
   observe(drainMeasure, { type: "measure", buffered: true });
+  observe(drainEvent, {
+    type: "event",
+    buffered: true,
+    durationThreshold: 16,
+  } as PerformanceObserverInit);
 
   store.flush = () => {
     for (const obs of observers) {
@@ -592,6 +678,7 @@ function browserCollector() {
       if (type === "longtask") drainLongTask(records);
       else if (type === "long-animation-frame") drainLoaf(records);
       else if (type === "measure") drainMeasure(records);
+      else if (type === "event" || type === "first-input") drainEvent(records);
     }
   };
 }
@@ -793,6 +880,10 @@ interface CdpInitiator {
 
 /** Trim the origin off a URL for compact display (mirrors the drilldown). */
 function shortenUrl(url: string): string {
+  if (url.startsWith("data:")) {
+    const comma = url.indexOf(",");
+    return `${url.slice(0, comma > 0 ? Math.min(comma, 40) : 40)}…`;
+  }
   return url.replace(/^https?:\/\/[^/]+/, "").slice(0, 60) || url.slice(0, 60);
 }
 
@@ -1500,6 +1591,36 @@ function buildCoverage(
   };
 }
 
+interface EpochEvent {
+  epochStart: number;
+  duration: number;
+  type: string;
+  start: number;
+  processingStart: number;
+  processingEnd: number;
+}
+
+/** Worst interaction in the span window, split into the three INP phases. */
+function buildSpanInteraction(
+  span: EpochWindow,
+  events: EpochEvent[],
+): SpanInteraction | undefined {
+  const inWindow = events.filter(
+    (e) => e.epochStart >= span.startEpochMs && e.epochStart <= span.endEpochMs,
+  );
+  if (inWindow.length === 0) return undefined;
+  let worst = inWindow[0];
+  for (const e of inWindow) if (e.duration > worst.duration) worst = e;
+  return {
+    count: inWindow.length,
+    maxDurationMs: round(worst.duration),
+    type: worst.type,
+    inputDelayMs: round(worst.processingStart - worst.start),
+    processingMs: round(worst.processingEnd - worst.processingStart),
+    presentationMs: round(worst.start + worst.duration - worst.processingEnd),
+  };
+}
+
 function buildReport(
   testInfo: TestInfo,
   url: string,
@@ -1533,6 +1654,14 @@ function buildReport(
     duration: l.duration,
     blocking: l.blocking,
   }));
+  const events: EpochEvent[] = (raw.events ?? []).map((e) => ({
+    epochStart: timeOrigin + e.start,
+    duration: e.duration,
+    type: e.type,
+    start: e.start,
+    processingStart: e.processingStart,
+    processingEnd: e.processingEnd,
+  }));
 
   const spanReports: SpanReport[] = spans.map((s) => {
     const render = renderEvents
@@ -1549,6 +1678,7 @@ function buildReport(
       cpu: buildSpanCpu(s, longTasks, loaf),
       render,
       memory: s.memory,
+      interaction: buildSpanInteraction(s, events),
       traceWindowUs: [s.traceStartUs, s.traceEndUs],
       budget: s.budget,
     };
@@ -1631,6 +1761,13 @@ function logSummary(report: PerfReport): void {
       `      cpu   block=${s.cpu.blockingMs}ms  longtasks=${s.cpu.longTaskCount}` +
         `  maxTask=${s.cpu.maxLongTaskMs}ms  loaf=${s.cpu.loafCount}/${s.cpu.maxLoafBlockingMs}ms`,
     );
+    if (s.interaction) {
+      const it = s.interaction;
+      lines.push(
+        `      inp   ${it.type}=${it.maxDurationMs}ms  (input ${it.inputDelayMs} / proc ${it.processingMs} / present ${it.presentationMs})` +
+          (it.count > 1 ? `  ${it.count} interactions` : ""),
+      );
+    }
     const r = s.render;
     const paint =
       r.paintCount !== undefined
@@ -1699,6 +1836,20 @@ function logSummary(report: PerfReport): void {
           ? "  (large selector×DOM product — PERF_CSS=1 to see the costly selectors)"
           : ""),
     );
+  }
+  if (report.media) {
+    const m = report.media;
+    lines.push(`  media  ${m.imageCount} images / ${m.imageKB}KB`);
+    for (const o of m.oversized.slice(0, 5)) {
+      lines.push(
+        `      oversized ${o.overFetch}×  ${o.naturalPx} shown ${o.renderedPx}  ${o.kb}KB  ${shortenUrl(o.url)}`,
+      );
+    }
+    for (const u of m.uncompressed.slice(0, 5)) {
+      lines.push(
+        `      uncompressed ${u.kb}KB (ratio ${u.ratio} [${u.type}])  ${shortenUrl(u.url)}`,
+      );
+    }
   }
   if (report.coverage) {
     const kb = (b: number) => Math.round(b / 102.4) / 10;
@@ -1901,6 +2052,88 @@ export const test = base.extend<{ perf: PerfController }>({
       covArtifact = built.artifact;
     }
 
+    // Image over-fetch + uncompressed resources, from Resource Timing + the DOM.
+    const media = await page
+      .evaluate(() => {
+        const res = performance.getEntriesByType(
+          "resource",
+        ) as PerformanceResourceTiming[];
+        const byUrl = new Map(res.map((r) => [r.name, r]));
+        const dpr = window.devicePixelRatio || 1;
+        let imageCount = 0;
+        let imageBytes = 0;
+        const oversized: Array<{
+          url: string;
+          naturalPx: string;
+          renderedPx: string;
+          overFetch: number;
+          kb: number;
+        }> = [];
+        for (const img of Array.from(document.images)) {
+          const url = img.currentSrc || img.src;
+          const nW = img.naturalWidth;
+          const nH = img.naturalHeight;
+          if (!url || !nW || !nH) continue;
+          imageCount += 1;
+          const r = byUrl.get(url);
+          const bytes = r ? r.encodedBodySize || r.transferSize || 0 : 0;
+          imageBytes += bytes;
+          const rect = img.getBoundingClientRect();
+          const rW = Math.round(rect.width);
+          const rH = Math.round(rect.height);
+          if (rW > 0 && rH > 0) {
+            const overFetch = (nW * nH) / (rW * rH * dpr * dpr);
+            if (overFetch >= 4) {
+              oversized.push({
+                url,
+                naturalPx: `${nW}x${nH}`,
+                renderedPx: `${rW}x${rH}`,
+                overFetch: Math.round(overFetch * 10) / 10,
+                kb: Math.round(bytes / 102.4) / 10,
+              });
+            }
+          }
+        }
+        oversized.sort((a, b) => b.kb - a.kb);
+        const textType = new Set([
+          "script",
+          "link",
+          "css",
+          "fetch",
+          "xmlhttprequest",
+          "other",
+        ]);
+        const uncompressed: Array<{
+          url: string;
+          kb: number;
+          ratio: number;
+          type: string;
+        }> = [];
+        for (const r of res) {
+          if (!textType.has(r.initiatorType)) continue;
+          const enc = r.encodedBodySize;
+          const dec = r.decodedBodySize;
+          if (!enc || !dec || enc < 20_000) continue; // skip tiny / cross-origin (no TAO)
+          const ratio = dec / enc;
+          if (ratio < 1.1) {
+            uncompressed.push({
+              url: r.name,
+              kb: Math.round(enc / 102.4) / 10,
+              ratio: Math.round(ratio * 100) / 100,
+              type: r.initiatorType,
+            });
+          }
+        }
+        uncompressed.sort((a, b) => b.kb - a.kb);
+        return {
+          imageCount,
+          imageKB: Math.round(imageBytes / 102.4) / 10,
+          oversized: oversized.slice(0, 10),
+          uncompressed: uncompressed.slice(0, 10),
+        };
+      })
+      .catch(() => undefined);
+
     const url = page.url();
     const reqs = finishNetwork();
     // finish the trace before buildReport so Paint/GPU can correlate to spans.
@@ -1915,7 +2148,7 @@ export const test = base.extend<{ perf: PerfController }>({
     const report = buildReport(
       testInfo,
       url,
-      raw ?? { vitals: {}, longTasks: [], loaf: [], measures: [] },
+      raw ?? { vitals: {}, longTasks: [], loaf: [], measures: [], events: [] },
       timeOrigin,
       controller.spans,
       reqs,
@@ -1923,6 +2156,8 @@ export const test = base.extend<{ perf: PerfController }>({
     );
 
     if (css) report.css = css;
+    if (media && (media.oversized.length || media.uncompressed.length || media.imageCount))
+      report.media = media;
     if (coverage) report.coverage = coverage;
     if (glRenderer) report.glRenderer = glRenderer;
     if (pageErrors.length) report.pageErrors = pageErrors;

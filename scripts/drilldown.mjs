@@ -338,6 +338,21 @@ if (initiators.length > 0) {
   }
 }
 
+// --- image decode cost (GPU/CPU spent turning bytes into bitmaps) ---
+const DECODE_NAMES = new Set(["Decode Image", "ImageDecodeTask", "Decode LazyPixelRef"]);
+let decodeMs = 0;
+let decodeCount = 0;
+for (const e of inWindow) {
+  if (e.dur == null || !DECODE_NAMES.has(e.name)) continue;
+  decodeMs += e.dur / 1000;
+  decodeCount += 1;
+}
+if (decodeCount > 0) {
+  console.log(
+    `\n  image decode: ${round(decodeMs)}ms across ${decodeCount} decodes (oversized images cost more to decode)`,
+  );
+}
+
 // --- CSS selector match cost (why style recalc is expensive) ---
 // SelectorStats events (disabled-by-default-blink.debug, i.e. PERF_CSS=1) carry
 // per-selector match stats for each recalc. Aggregating elapsed time names the

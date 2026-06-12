@@ -121,6 +121,14 @@ function aggregateSlug(slug, runs) {
       },
       render,
       memory,
+      interaction: items.some((s) => s.interaction)
+        ? {
+            maxDurationMs: statBy(items, (s) => s.interaction?.maxDurationMs ?? 0),
+            inputDelayMs: statBy(items, (s) => s.interaction?.inputDelayMs ?? 0),
+            processingMs: statBy(items, (s) => s.interaction?.processingMs ?? 0),
+            presentationMs: statBy(items, (s) => s.interaction?.presentationMs ?? 0),
+          }
+        : undefined,
       budget,
     };
   });
@@ -172,6 +180,7 @@ const STAT_OF = {
   jsHeapUsedMB: (s) => s.memory?.jsHeapUsedMB,
   jsHeapDeltaMB: (s) => s.memory?.jsHeapDeltaMB,
   listenersDelta: (s) => s.memory?.listenersDelta,
+  interactionMs: (s) => s.interaction?.maxDurationMs,
 };
 
 /**
@@ -237,6 +246,11 @@ function printSummary(agg) {
     lines.push(
       `      cpu    block=${fmt(s.cpu.blockingMs)}ms  maxTask=${fmt(s.cpu.maxLongTaskMs)}ms`,
     );
+    if (s.interaction) {
+      lines.push(
+        `      inp    ${fmt(s.interaction.maxDurationMs)}ms  (input ${fmt(s.interaction.inputDelayMs)} / proc ${fmt(s.interaction.processingMs)} / present ${fmt(s.interaction.presentationMs)})`,
+      );
+    }
     const r = s.render;
     const paint = r.paintCount
       ? `  paint=${fmt(r.paintCount)}/${fmt(r.paintMs)}ms  gpu=${fmt(r.gpuMs)}ms`

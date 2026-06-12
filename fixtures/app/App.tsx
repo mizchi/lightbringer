@@ -448,6 +448,45 @@ function SelectorCost({ fixed }: { fixed: boolean }) {
   );
 }
 
+// Scenario 15: image over-fetch. slow renders a 1600×1600 image inside an 80×80
+// box (16k× the pixels it shows); fixed renders an 80×80 image. Lights up
+// report.media.oversized (intrinsic px ≫ rendered px). The image is a
+// canvas-generated data URL so the fixture needs no binary asset.
+function ImageWeight({ fixed }: { fixed: boolean }) {
+  const ref = useRef<HTMLImageElement>(null);
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    const size = fixed ? 80 : 1600;
+    const c = document.createElement("canvas");
+    c.width = size;
+    c.height = size;
+    const ctx = c.getContext("2d");
+    if (!ctx) return;
+    const g = ctx.createLinearGradient(0, 0, size, size);
+    g.addColorStop(0, "#f00");
+    g.addColorStop(1, "#00f");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, size, size);
+    // noise so it isn't trivially compressible (realistic photo-ish weight)
+    for (let i = 0; i < 3000; i++) {
+      ctx.fillStyle = `rgb(${i % 255},${(i * 7) % 255},${(i * 13) % 255})`;
+      ctx.fillRect((i * 31) % size, (i * 17) % size, 6, 6);
+    }
+    const img = ref.current;
+    if (img) {
+      img.onload = () => setReady(true);
+      img.src = c.toDataURL("image/png");
+    }
+  }, [fixed]);
+  return (
+    <main>
+      <h1>image {fixed ? "(fixed)" : "(slow)"}</h1>
+      <img ref={ref} width={80} height={80} alt="" />
+      <div id="status">{ready ? "done" : "loading"}</div>
+    </main>
+  );
+}
+
 // ===========================================================================
 // Initialization bucket: resource problems on the scenario's initial load.
 // Each shows a "ready" marker only once init is done, so the initial-load span
@@ -556,6 +595,8 @@ export function App() {
       return <Leak fixed={fixed} />;
     case "selector-cost":
       return <SelectorCost fixed={fixed} />;
+    case "image":
+      return <ImageWeight fixed={fixed} />;
     default:
       return <Rerender fixed={fixed} />;
   }

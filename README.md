@@ -51,6 +51,11 @@ Per **span** (one `perf.measure(name, action)` region):
   domain (`network.thirdParty`). CPU spent by third-party scripts is attributed
   by the drilldown, which classifies each CPU-profiler frame by its script URL.
 - **cpu** — long task count, total blocking time, heaviest long task, LoAF.
+- **interaction** (per-step INP) — the worst interaction *inside each span*, split
+  into input delay / processing / presentation (Event Timing). web-vitals reports
+  one page-global worst INP; this tells you which step was janky and why (e.g. a
+  toggle whose 80 ms is almost all presentation = the repaint after it, not the
+  handler). `interactionMs` is budgetable.
 - **render** — style recalc / layout count and time (from CDP
   `Performance.getMetrics` cumulative counters), JS execution time; and, with
   `PERF_TRACE=1`, Paint count/time and **GPU task time** (`gpuMs`) from the trace.
@@ -73,6 +78,9 @@ Per **span** (one `perf.measure(name, action)` region):
   flagged `⚠ likely leak`) — the reliable leak signal, since repeating averages out
   the single-step GC noise.
 
+- **media** — image over-fetch (intrinsic px ≫ rendered px — a 1760×626 logo shown
+  at 128×46 is 187× too big) and large resources shipped near-uncompressed
+  (decoded ≈ encoded), from Resource Timing + the DOM. `report.media`.
 - **coverage** (PERF_COV=1) — JS + CSS coverage across the whole scenario: how
   much of each downloaded chunk / stylesheet the run actually executed. Per-chunk
   `usedPct` flags chunks split too coarsely (low usage ⇒ lazy-load / drop
@@ -319,7 +327,8 @@ Either way, violations are also printed in the per-run summary (`! budget: ...`)
 Span budget fields: `durationMs`, `scriptMs`, `blockingMs`, `encodedKB`,
 `requestCount`, `waves`, `busyMs`, `thirdPartyKB`, `thirdPartyRequestCount`,
 `layoutCount`, `recalcStyleMs`, `recalcStyleCount`, `nodes`, `jsHeapUsedMB`,
-`jsHeapDeltaMB`, `listenersDelta`, `paintCount` / `paintMs` / `gpuMs` (PERF_TRACE only). The memory bounds
+`jsHeapDeltaMB`, `listenersDelta`, `interactionMs`, `paintCount` / `paintMs` /
+`gpuMs` (PERF_TRACE only). The memory bounds
 (`jsHeapDeltaMB` especially) are only trustworthy under `PERF_MEM=1`; prefer the
 count-based `listenersDelta` for a GC-stable gate. For page-global web-vitals,
 declare a separate budget once per test:
@@ -451,6 +460,14 @@ Things that bite, learned from the accuracy probe:
   points at the referencing document, and `preload` / `other` carry no frame. A
   fetch deep inside a bundled/minified vendor chunk attributes to that chunk's
   url:line, not your source, unless source maps are applied downstream.
+- **Media analysis caveats.** Image over-fetch uses intrinsic vs rendered pixels,
+  so it works for any `<img>`, but `data:` URLs and cross-origin images without
+  `Timing-Allow-Origin` report 0 KB (they're not in Resource Timing) — the over-fetch
+  ratio is still correct, only the byte figure is missing. The uncompressed-resource
+  check depends on the serving layer: `vite preview` may not gzip, so it can flag
+  chunks a real CDN would compress — confirm against production hosting.
+- **Per-span interaction** uses Event Timing with a 16 ms `durationThreshold`, so
+  sub-16 ms (already-responsive) interactions don't appear — absence is good news.
 - **`PERF_PORT` overrides the fixture dev-server port** (default 5173). Set it to a
   free port when another Vite project is already on 5173 — otherwise Playwright
   reuses that server and silently measures the wrong app.
@@ -487,6 +504,7 @@ regression fixture for the tool. `?fixed` (or `BENCH_FIXED=1`) toggles the fix.
 | leak | each click retains objects / buffers / listeners forever | `memory.listenersDelta` / `arrayBuffers` (PERF_MEM) | +19 listeners / +30 buffers → ~0 | drop refs, unbind listeners |
 | leak-trend | the same leak, repeated 6× via `measureRepeat` | `report.trends` (PERF_MEM) | heap +9.2 MB/step monotonic → flat | drop refs, unbind listeners |
 | selector-cost | big DOM × many matching complex selectors; toggle restyles all | `render.recalcStyleMs` (+ `PERF_CSS` drilldown) | ~22 → 0.5 ms | fewer / flatter / scoped selectors |
+| image | a 1600×1600 image rendered in an 80×80 box | `report.media.oversized` | 400× over-fetch → 1× | serve at display size (or 2× DPR) |
 
 `stress` is different: it doesn't measure an app bottleneck, it stresses
 lightbringer's own data handling — 600 concurrent requests + a 150k-mark trace
