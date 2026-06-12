@@ -73,6 +73,12 @@ Per **span** (one `perf.measure(name, action)` region):
   flagged `⚠ likely leak`) — the reliable leak signal, since repeating averages out
   the single-step GC noise.
 
+- **coverage** (PERF_COV=1) — JS + CSS coverage across the whole scenario: how
+  much of each downloaded chunk / stylesheet the run actually executed. Per-chunk
+  `usedPct` flags chunks split too coarsely (low usage ⇒ lazy-load / drop
+  candidate), and `scripts/coverage.mjs` unions the used byte ranges across every
+  scenario to find code **no** scenario touched (dead code / over-shipping).
+
 All times are unified to epoch ms so spans correlate with network / CPU even
 across navigations.
 
@@ -115,6 +121,7 @@ PERF_CPU=4 pnpm exec playwright test            # throttle CPU 4x (mid-tier devi
 PERF_GPU=1 pnpm exec playwright test            # hardware GL (real GPU/paint numbers)
 PERF_MEM=1 pnpm exec playwright test            # force GC at span boundaries (retained-only memory deltas)
 PERF_CSS=1 pnpm exec playwright test            # capture per-selector style-recalc match stats (in the trace)
+PERF_COV=1 pnpm exec playwright test            # record JS+CSS coverage (chunk usage / dead code)
 pnpm exec playwright test --repeat-each=5        # multiple runs for median
 node node_modules/lightbringer/scripts/median.mjs
 ```
@@ -238,6 +245,44 @@ Run it under `PERF_MEM=1` so each repeat's memory is measured after a forced GC
 (retained-only) — that's what makes even `jsHeapUsedMB` resolve into a clean line.
 A non-leaking step reports no trend. This stays inside one scenario, so it isn't
 the out-of-scope cross-scenario analysis.
+
+### Coverage & chunk-split analysis (`PERF_COV`)
+
+`PERF_COV=1` records JS + CSS coverage across the whole scenario (it doesn't reset
+on navigation, so it accrues over every page and interaction). The per-run summary
+shows how much of each chunk the scenario used:
+
+```
+  coverage (PERF_COV — scenario-wide):
+  js   25.8% used  (547.1/2119.7KB)
+       22.7% used  716KB unused  /assets/vendor-maplibre-….js
+       17.1% used  286.8KB unused  /assets/vendor-turf-….js
+  css  95.4% used  (96.5/101.2KB)
+```
+
+To find code that **no** scenario in the suite used (dead code / over-shipping),
+run the whole suite with `PERF_COV=1`, then union the per-scenario coverage:
+
+```sh
+PERF_COV=1 pnpm exec playwright test
+node node_modules/lightbringer/scripts/coverage.mjs --min=30
+```
+
+```
+[coverage] union across 7 scenario run(s)
+  JS  31% used overall  (640/2060KB, 1420KB never used)
+    never used by any scenario (dead-code / over-shipping):
+        45.2KB  /assets/admin-….js
+    under 30% used (split too coarse / lazy-load candidate):
+       17.1% used  286.8KB unused  /assets/vendor-turf-….js
+```
+
+A byte is "used" if *any* scenario executed it, so a chunk that stays low after
+the whole suite is a real split/lazy-load candidate. Notes: measure a **production
+build** (`vite build` + `vite preview`) — a dev server ships unbundled modules, so
+chunk analysis is meaningless. A framework vendor chunk (react) sitting at ~25% is
+expected and not splittable; the actionable signals are feature libs (e.g. turf
+only needed for some geo ops) and your own app chunks. Coverage is Chromium-only.
 
 ## Budgets (CI regression gate)
 

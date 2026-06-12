@@ -50,6 +50,16 @@ const PERF_OUT_DIR = path.resolve(process.env.PERF_OUT_DIR ?? "perf-results");
  */
 const CSS_STATS = process.env.PERF_CSS === "1";
 
+/**
+ * PERF_COV=1 records JS + CSS coverage across the whole scenario
+ * (resetOnNavigation: false) via Playwright's Chromium coverage API. It reveals
+ * how much of each downloaded chunk / stylesheet the scenario actually used —
+ * low usage means the chunk is split too coarsely or shipped needlessly. Across
+ * scenarios, scripts/coverage.mjs unions the used ranges to find code no scenario
+ * touched (dead-code / over-shipping candidates). Chromium-only; expensive.
+ */
+const COV_ENABLED = process.env.PERF_COV === "1";
+
 /** With PERF_TRACE=1 (or PERF_CSS=1), save a Chrome trace (openable in DevTools / Perfetto). */
 const TRACE_ENABLED = process.env.PERF_TRACE === "1" || CSS_STATS;
 
@@ -394,6 +404,8 @@ export interface PerfReport {
   network: NetworkReport;
   /** page CSS/DOM capacity — the "why is style recalc expensive" denominator */
   css?: CssProfile;
+  /** JS/CSS coverage across the scenario (PERF_COV=1) — chunk usage / dead code */
+  coverage?: Coverage;
   /** WebGL renderer string; "SwiftShader" means software GL (GPU numbers are fake) */
   glRenderer?: string;
   /** uncaught page errors during measurement; non-empty means results are suspect */
@@ -419,6 +431,29 @@ export interface CssProfile {
   selectors: number;
   /** live DOM element count */
   domNodes: number;
+}
+
+/** Coverage of one downloaded resource (a JS chunk or a stylesheet). */
+export interface CoverageFile {
+  url: string;
+  totalBytes: number;
+  usedBytes: number;
+  /** usedBytes / totalBytes as a percentage (0..100) */
+  usedPct: number;
+}
+
+/** JS or CSS coverage rollup for the scenario. */
+export interface CoverageReport {
+  totalBytes: number;
+  usedBytes: number;
+  usedPct: number;
+  /** per-resource, heaviest unused first (the best split / drop candidates) */
+  files: CoverageFile[];
+}
+
+export interface Coverage {
+  js: CoverageReport;
+  css: CoverageReport;
 }
 
 /** Strategy that waits until the page has settled after an action. */
@@ -1307,6 +1342,151 @@ function buildTrends(spans: SpanReport[]): MemoryTrend[] {
   return trends;
 }
 
+// --- coverage (PERF_COV) -------------------------------------------------
+// Playwright Chromium coverage entry shapes (only the fields we read).
+interface JSCoverageEntry {
+  url: string;
+  source?: string;
+  functions: Array<{
+    ranges: Array<{ startOffset: number; endOffset: number; count: number }>;
+  }>;
+}
+interface CSSCoverageEntry {
+  url: string;
+  text?: string;
+  ranges: Array<{ start: number; end: number }>;
+}
+
+/** Per-resource used byte ranges (merged), kept for cross-scenario union. */
+interface CoverageArtifact {
+  js: Array<{ url: string; total: number; used: Array<[number, number]> }>;
+  css: Array<{ url: string; total: number; used: Array<[number, number]> }>;
+}
+
+/** Merge overlapping/adjacent byte ranges into a minimal sorted set. */
+function mergeRanges(ranges: Array<[number, number]>): Array<[number, number]> {
+  if (ranges.length === 0) return [];
+  const sorted = [...ranges].sort((a, b) => a[0] - b[0]);
+  const out: Array<[number, number]> = [[sorted[0][0], sorted[0][1]]];
+  for (let i = 1; i < sorted.length; i++) {
+    const [s, e] = sorted[i];
+    const last = out[out.length - 1];
+    if (s <= last[1]) last[1] = Math.max(last[1], e);
+    else out.push([s, e]);
+  }
+  return out;
+}
+
+const rangesLen = (r: Array<[number, number]>): number =>
+  r.reduce((a, [s, e]) => a + (e - s), 0);
+
+/**
+ * V8 block coverage → used byte ranges. Ranges are nested: a byte's coverage is
+ * the count of the INNERMOST range containing it (the outermost range is the whole
+ * module and is count>0 whenever it merely evaluated, so a naive union of count>0
+ * ranges reports ~100%). Paint outer→inner (inner overrides) and extract the runs
+ * that ended up covered.
+ */
+function jsUsedRanges(
+  functions: JSCoverageEntry["functions"],
+  total: number,
+): Array<[number, number]> {
+  if (!total) return [];
+  const ranges: Array<{ startOffset: number; endOffset: number; count: number }> = [];
+  for (const fn of functions) for (const r of fn.ranges) ranges.push(r);
+  // outer first: smaller start, then larger end; inner ranges come later and override
+  ranges.sort((a, b) => a.startOffset - b.startOffset || b.endOffset - a.endOffset);
+  const paint = new Uint8Array(total);
+  for (const r of ranges) {
+    paint.fill(r.count > 0 ? 1 : 0, r.startOffset, Math.min(r.endOffset, total));
+  }
+  const out: Array<[number, number]> = [];
+  let start = -1;
+  for (let i = 0; i < total; i++) {
+    if (paint[i] === 1) {
+      if (start < 0) start = i;
+    } else if (start >= 0) {
+      out.push([start, i]);
+      start = -1;
+    }
+  }
+  if (start >= 0) out.push([start, total]);
+  return out;
+}
+
+/** Group by url, merge used ranges; total = source/text length (or max offset). */
+function collectCoverage(
+  items: Array<{ url: string; total: number; used: Array<[number, number]> }>,
+): Array<{ url: string; total: number; used: Array<[number, number]> }> {
+  const by = new Map<
+    string,
+    { total: number; used: Array<[number, number]> }
+  >();
+  for (const it of items) {
+    if (!it.url) continue; // skip inline/anonymous
+    const b = by.get(it.url) ?? { total: 0, used: [] };
+    b.total = Math.max(b.total, it.total);
+    b.used.push(...it.used);
+    by.set(it.url, b);
+  }
+  return [...by.entries()].map(([url, b]) => ({
+    url,
+    total: b.total,
+    used: mergeRanges(b.used),
+  }));
+}
+
+function toCoverageReport(
+  perUrl: Array<{ url: string; total: number; used: Array<[number, number]> }>,
+): CoverageReport {
+  let totalBytes = 0;
+  let usedBytes = 0;
+  const files = perUrl.map((f) => {
+    const used = rangesLen(f.used);
+    totalBytes += f.total;
+    usedBytes += used;
+    return {
+      url: f.url,
+      totalBytes: f.total,
+      usedBytes: used,
+      usedPct: f.total > 0 ? Math.round((used / f.total) * 1000) / 10 : 0,
+    };
+  });
+  // heaviest unused first — the best split/drop candidates
+  files.sort((a, b) => b.totalBytes - b.usedBytes - (a.totalBytes - a.usedBytes));
+  return {
+    totalBytes,
+    usedBytes,
+    usedPct: totalBytes > 0 ? Math.round((usedBytes / totalBytes) * 1000) / 10 : 0,
+    files: files.slice(0, 40),
+  };
+}
+
+/** Build the scenario coverage report + the range artifact (for cross-scenario union). */
+function buildCoverage(
+  js: JSCoverageEntry[],
+  css: CSSCoverageEntry[],
+): { coverage: Coverage; artifact: CoverageArtifact } {
+  const jsItems = js.map((e) => {
+    let maxEnd = 0;
+    for (const fn of e.functions)
+      for (const r of fn.ranges) if (r.endOffset > maxEnd) maxEnd = r.endOffset;
+    const total = e.source?.length ?? maxEnd;
+    return { url: e.url, total, used: jsUsedRanges(e.functions, total) };
+  });
+  const cssItems = css.map((e) => ({
+    url: e.url,
+    total: e.text?.length ?? 0,
+    used: e.ranges.map((r) => [r.start, r.end] as [number, number]),
+  }));
+  const jsPerUrl = collectCoverage(jsItems);
+  const cssPerUrl = collectCoverage(cssItems);
+  return {
+    coverage: { js: toCoverageReport(jsPerUrl), css: toCoverageReport(cssPerUrl) },
+    artifact: { js: jsPerUrl, css: cssPerUrl },
+  };
+}
+
 function buildReport(
   testInfo: TestInfo,
   url: string,
@@ -1507,6 +1687,26 @@ function logSummary(report: PerfReport): void {
           : ""),
     );
   }
+  if (report.coverage) {
+    const kb = (b: number) => Math.round(b / 102.4) / 10;
+    const cov = (label: string, c: CoverageReport) => {
+      if (c.totalBytes === 0) return;
+      lines.push(
+        `  ${label}  ${c.usedPct}% used  (${kb(c.usedBytes)}/${kb(c.totalBytes)}KB)`,
+      );
+      // chunks the scenario barely touched — split too coarse / shipped needlessly
+      for (const f of c.files) {
+        if (f.totalBytes < 5_000) continue; // ignore tiny files
+        if (f.usedPct >= 40) continue;
+        lines.push(
+          `      ${String(f.usedPct).padStart(5)}% used  ${kb(f.totalBytes - f.usedBytes)}KB unused  ${shortenUrl(f.url)}`,
+        );
+      }
+    };
+    lines.push("  coverage (PERF_COV — scenario-wide):");
+    cov("js ", report.coverage.js);
+    cov("css", report.coverage.css);
+  }
   lines.push(
     `  total network ${report.network.totalRequests} reqs / ${report.network.totalEncodedKB}KB`,
   );
@@ -1600,6 +1800,16 @@ export const test = base.extend<{ perf: PerfController }>({
       ? await startTrace(client, tracePath)
       : undefined;
 
+    // Coverage spans the whole scenario (resetOnNavigation:false) so it accrues
+    // across every goto/interaction. Chromium-only; guard on page.coverage.
+    if (COV_ENABLED && page.coverage) {
+      await page.coverage.startJSCoverage({
+        resetOnNavigation: false,
+        reportAnonymousScripts: false,
+      });
+      await page.coverage.startCSSCoverage({ resetOnNavigation: false });
+    }
+
     const controller = new PerfController(page, client);
     await use(controller);
 
@@ -1664,6 +1874,20 @@ export const test = base.extend<{ perf: PerfController }>({
       })
       .catch(() => undefined);
 
+    // Stop coverage while the page is still open; build the report + range artifact.
+    let coverage: Coverage | undefined;
+    let covArtifact: CoverageArtifact | undefined;
+    if (COV_ENABLED && page.coverage) {
+      const jsCov = await page.coverage.stopJSCoverage().catch(() => []);
+      const cssCov = await page.coverage.stopCSSCoverage().catch(() => []);
+      const built = buildCoverage(
+        jsCov as unknown as JSCoverageEntry[],
+        cssCov as unknown as CSSCoverageEntry[],
+      );
+      coverage = built.coverage;
+      covArtifact = built.artifact;
+    }
+
     const url = page.url();
     const reqs = finishNetwork();
     // finish the trace before buildReport so Paint/GPU can correlate to spans.
@@ -1686,6 +1910,7 @@ export const test = base.extend<{ perf: PerfController }>({
     );
 
     if (css) report.css = css;
+    if (coverage) report.coverage = coverage;
     if (glRenderer) report.glRenderer = glRenderer;
     if (pageErrors.length) report.pageErrors = pageErrors;
     if (Object.keys(controller.vitalsBudget).length > 0)
@@ -1698,6 +1923,13 @@ export const test = base.extend<{ perf: PerfController }>({
 
     const jsonPath = path.join(PERF_OUT_DIR, `${slug}.${runTag}.json`);
     fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2));
+    // Range artifact for cross-scenario union (scripts/coverage.mjs).
+    if (covArtifact) {
+      fs.writeFileSync(
+        path.join(PERF_OUT_DIR, `${slug}.${runTag}.coverage.json`),
+        JSON.stringify(covArtifact),
+      );
+    }
     await testInfo.attach("perf-report", {
       path: jsonPath,
       contentType: "application/json",
