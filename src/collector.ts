@@ -105,6 +105,26 @@ export interface ThirdPartyBreakdown {
   }>;
 }
 
+/**
+ * What triggered a request (CDP `Network.requestWillBeSent.initiator`). The
+ * network-side analogue of the CPU drilldown: when a span's waterfall is deep,
+ * this points at the code (or the parser) that issued the requests.
+ */
+export interface Initiator {
+  /** script | parser | preload | preflight | other */
+  type: string;
+  /** best-effort triggering site: "functionName  url:line" (script) or "url:line" (parser) */
+  frame?: string;
+}
+
+/** Requests grouped by what issued them (heaviest first, by request count). */
+export interface InitiatorStat {
+  frame: string;
+  type: string;
+  requestCount: number;
+  encodedKB: number;
+}
+
 /** Network breakdown of a span (network bottleneck analysis). */
 export interface SpanNetwork {
   requestCount: number;
@@ -115,6 +135,8 @@ export interface SpanNetwork {
   waves: number;
   /** subset of this span's network attributable to third-party origins */
   thirdParty: ThirdPartyBreakdown;
+  /** requests grouped by what issued them (top issuers first); over ALL requests */
+  byInitiator: InitiatorStat[];
   requests: Array<{
     url: string;
     type: string;
@@ -124,6 +146,8 @@ export interface SpanNetwork {
     kb: number;
     /** true if served from a registrable domain other than the page's */
     thirdParty: boolean;
+    /** what triggered the request (code / parser), best-effort */
+    initiator?: Initiator;
   }>;
 }
 
@@ -304,6 +328,8 @@ export interface NetworkReport {
   slowest: Array<{ url: string; type: string; durationMs: number; kb: number }>;
   /** scenario-wide third-party total (bytes/requests the app didn't ship) */
   thirdParty: ThirdPartyBreakdown;
+  /** scenario-wide request issuers (which code / parser issued the most requests) */
+  byInitiator: InitiatorStat[];
 }
 
 /** Upper bounds on page-global web-vitals (gated on the median, like span budgets). */
@@ -681,6 +707,46 @@ interface NetReq {
   startEpochMs: number;
   endEpochMs?: number;
   encoded?: number;
+  initiator?: Initiator;
+}
+
+/** CDP initiator shape (only the fields we read). */
+interface CdpInitiator {
+  type?: string;
+  url?: string;
+  lineNumber?: number;
+  stack?: {
+    callFrames?: Array<{
+      functionName?: string;
+      url?: string;
+      lineNumber?: number;
+    }>;
+  };
+}
+
+/** Trim the origin off a URL for compact display (mirrors the drilldown). */
+function shortenUrl(url: string): string {
+  return url.replace(/^https?:\/\/[^/]+/, "").slice(0, 60) || url.slice(0, 60);
+}
+
+/** Reduce a CDP initiator to a type + a single best-effort triggering frame. */
+function summarizeInitiator(init: CdpInitiator | undefined): Initiator | undefined {
+  if (!init) return undefined;
+  const type = init.type ?? "other";
+  const frames = init.stack?.callFrames ?? [];
+  // the topmost frame with a script URL is the code that issued the request
+  const top = frames.find((f) => f.url) ?? frames[0];
+  if (top) {
+    const fn = top.functionName || "(anonymous)";
+    const loc = top.url ? `${shortenUrl(top.url)}:${(top.lineNumber ?? 0) + 1}` : "";
+    return { type, frame: `${fn}  ${loc}`.trim() };
+  }
+  // parser-inserted (e.g. <img>/<script src>): initiator.url is the referencing doc
+  if (init.url) {
+    const loc = init.lineNumber != null ? `:${init.lineNumber + 1}` : "";
+    return { type, frame: `${shortenUrl(init.url)}${loc}` };
+  }
+  return { type };
 }
 
 async function startNetworkCapture(
@@ -696,12 +762,14 @@ async function startNetworkCapture(
       type?: string;
       timestamp: number;
       wallTime: number;
+      initiator?: CdpInitiator;
     };
     reqs.set(p.requestId, {
       url: p.request.url,
       type: p.type ?? "Other",
       startMono: p.timestamp,
       startEpochMs: p.wallTime * 1000,
+      initiator: summarizeInitiator(p.initiator),
     });
   });
   client.on("Network.responseReceived", (e) => {
@@ -881,6 +949,26 @@ function buildThirdParty(
   };
 }
 
+/** Aggregate requests by their initiator frame (top issuers first, by count). */
+function buildInitiators(
+  records: Array<{ initiator?: Initiator; encodedKB: number }>,
+): InitiatorStat[] {
+  const by = new Map<string, InitiatorStat>();
+  for (const r of records) {
+    if (!r.initiator) continue;
+    const frame = r.initiator.frame ?? `(${r.initiator.type})`;
+    const bucket =
+      by.get(frame) ??
+      by.set(frame, { frame, type: r.initiator.type, requestCount: 0, encodedKB: 0 }).get(frame)!;
+    bucket.requestCount += 1;
+    bucket.encodedKB += r.encodedKB;
+  }
+  return [...by.values()]
+    .map((s) => ({ ...s, encodedKB: round(s.encodedKB) }))
+    .sort((a, b) => b.requestCount - a.requestCount || b.encodedKB - a.encodedKB)
+    .slice(0, 8);
+}
+
 /** Length of the union of intervals. Used for network busy time. */
 function unionLength(intervals: Array<[number, number]>): number {
   if (intervals.length === 0) return 0;
@@ -944,6 +1032,7 @@ function buildGlobalNetwork(
     url: string;
     encodedKB: number;
     interval?: [number, number];
+    initiator?: Initiator;
   }> = [];
   for (const r of reqs) {
     const encoded = r.encoded ?? 0;
@@ -964,6 +1053,7 @@ function buildGlobalNetwork(
       encodedKB: encoded / 1024,
       interval:
         r.endEpochMs != null ? [r.startEpochMs, r.endEpochMs] : undefined,
+      initiator: r.initiator,
     });
   }
   for (const b of Object.values(byType)) b.encodedKB = round(b.encodedKB);
@@ -974,6 +1064,7 @@ function buildGlobalNetwork(
     byType,
     slowest: finished.slice(0, 8),
     thirdParty: buildThirdParty(tpRecords, firstPartyDomain),
+    byInitiator: buildInitiators(tpRecords),
   };
 }
 
@@ -993,6 +1084,7 @@ function buildSpanNetwork(
     url: string;
     encodedKB: number;
     interval?: [number, number];
+    initiator?: Initiator;
   }> = [];
   let encoded = 0;
   for (const r of reqs) {
@@ -1012,8 +1104,14 @@ function buildSpanNetwork(
       durationMs: round(end - r.startEpochMs),
       kb: round((r.encoded ?? 0) / 1024),
       thirdParty: tp,
+      initiator: r.initiator,
     });
-    tpRecords.push({ url: r.url, encodedKB: (r.encoded ?? 0) / 1024, interval });
+    tpRecords.push({
+      url: r.url,
+      encodedKB: (r.encoded ?? 0) / 1024,
+      interval,
+      initiator: r.initiator,
+    });
   }
   requests.sort((a, b) => b.durationMs - a.durationMs);
   // Cap the per-request detail list: a span on a request-heavy page can hold
@@ -1026,6 +1124,7 @@ function buildSpanNetwork(
     busyMs: round(unionLength(intervals)),
     waves: countWaves(intervals),
     thirdParty: buildThirdParty(tpRecords, firstPartyDomain),
+    byInitiator: buildInitiators(tpRecords),
     requests: requests.slice(0, REQUESTS_PER_SPAN_LIMIT),
   };
 }
@@ -1277,6 +1376,15 @@ function logSummary(report: PerfReport): void {
       lines.push(
         `      3p    ${tp.requestCount}reqs  ${tp.encodedKB}KB  busy=${tp.busyMs}ms  [${top}]`,
       );
+    }
+    // When the waterfall is deep (or request-heavy), name the code that issued the
+    // requests — the network-side "who's responsible" the way the drilldown does CPU.
+    if (s.network.byInitiator.length > 0 && (s.network.waves >= 2 || s.network.requestCount >= 5)) {
+      const top = s.network.byInitiator
+        .slice(0, 3)
+        .map((it) => `${it.frame} (${it.requestCount})`)
+        .join("  ");
+      lines.push(`      ↳ from ${top}`);
     }
     lines.push(
       `      cpu   block=${s.cpu.blockingMs}ms  longtasks=${s.cpu.longTaskCount}` +

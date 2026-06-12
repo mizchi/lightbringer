@@ -41,7 +41,10 @@ Per **span** (one `perf.measure(name, action)` region):
 - **web-vitals (attribution build)** — LCP / INP / CLS / TTFB / FCP with attribution.
 - **network** (CDP) — request count, transferred KB, `busyMs` (union of request
   intervals = how long the network was actually busy), and `waves` (approximate
-  serial-dependency depth of the waterfall).
+  serial-dependency depth of the waterfall). Each request also carries its
+  **initiator** (the code or parser that issued it); `network.byInitiator` rolls
+  them up so a deep waterfall points straight at the responsible function
+  (`get  /App.tsx:244 (6)`) — the network-side analogue of the CPU drilldown.
 - **third-party** — the slice of the network served from a registrable domain
   other than the page's: bytes the app didn't ship and network time it didn't
   ask for (analytics, tag managers, ad tech, embedded widgets), broken down per
@@ -152,11 +155,13 @@ PERF_TRACE=1 pnpm exec playwright test
 lightbringer-drilldown <slug> <spanName>
 ```
 
-It prints three views: an event-name breakdown (Layout / Paint / FunctionCall /
+It prints these views: an event-name breakdown (Layout / Paint / FunctionCall /
 WebGL / `v8.parseOnBackground` / …), a function **total** time (includes children),
-and a function **self** time computed from the V8 CPU profiler — the latter is what
+a function **self** time computed from the V8 CPU profiler — the latter is what
 pinpoints the actual hot function (e.g. a specific React render), with V8 synthetic
-frames like `(idle)` / `(program)` filtered out.
+frames like `(idle)` / `(program)` filtered out — a **GPU** rollup (GPUTask /
+RasterTask), and **network initiators** (which code issued the span's requests,
+straight from the report, so it needs no trace).
 
 ### App spans (`withSpan`)
 
@@ -382,6 +387,12 @@ Things that bite, learned from the accuracy probe:
   leak signals. `JSHeapUsedSize` excludes off-heap buffer bytes (typed arrays /
   wasm / GPU staging), which is why a leaked 8 MB `Float64Array` shows only as the
   ArrayBuffer count going up, not as heap MB.
+- **Request initiators are best-effort.** They come from CDP
+  `Network.requestWillBeSent.initiator`: a `script` initiator carries a JS call
+  stack (lightbringer keeps the topmost frame with a URL), a `parser` initiator
+  points at the referencing document, and `preload` / `other` carry no frame. A
+  fetch deep inside a bundled/minified vendor chunk attributes to that chunk's
+  url:line, not your source, unless source maps are applied downstream.
 - **`PERF_PORT` overrides the fixture dev-server port** (default 5173). Set it to a
   free port when another Vite project is already on 5173 — otherwise Playwright
   reuses that server and silently measures the wrong app.

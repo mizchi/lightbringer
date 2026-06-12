@@ -321,3 +321,19 @@ if (gpuRanked.length === 0) {
 for (const r of gpuRanked) {
   console.log(`    ${String(r.totalMs).padStart(8)}ms x${r.count}  ${r.name}`);
 }
+
+// --- network initiators (which code issued this span's requests) ---
+// From the report (CDP Network.requestWillBeSent.initiator), so it needs no trace.
+// The network-side analogue of the CPU self-time: when waves is deep, this names
+// the code (or parser) responsible for the waterfall.
+const initiators = span.network?.byInitiator ?? [];
+if (initiators.length > 0) {
+  console.log(
+    `\n  network initiators (who issued the ${span.network.requestCount} requests, ${span.network.waves} waves):`,
+  );
+  for (const it of initiators) {
+    console.log(
+      `    ${String(it.requestCount).padStart(4)} reqs  ${String(it.encodedKB).padStart(7)}KB  ${it.frame}  [${it.type}]`,
+    );
+  }
+}
