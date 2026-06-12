@@ -1314,19 +1314,32 @@ function buildTrends(spans: SpanReport[]): MemoryTrend[] {
       // when the endpoints happen to be higher. Require the net climb to dominate
       // the jitter — otherwise the +N is noise, not retention.
       let maxDrop = 0;
+      let maxStepInc = 0;
+      let incCount = 0;
       for (let i = 1; i < values.length; i++) {
-        const drop = values[i - 1] - values[i];
-        if (drop > maxDrop) maxDrop = drop;
+        const delta = values[i] - values[i - 1];
+        if (delta > 0) {
+          incCount += 1;
+          if (delta > maxStepInc) maxStepInc = delta;
+        } else if (-delta > maxDrop) {
+          maxDrop = -delta;
+        }
       }
       const monotonic = maxDrop <= 0.1 * Math.abs(growth);
-      // Relative gate: the growth must be a meaningful fraction of the baseline,
-      // not just past an absolute floor. A fixed floor mis-fires across apps —
-      // maplibre juggles ~1500 tile ArrayBuffers, so a churn of +8 (0.5%) isn't a
-      // leak, while a fixture going 30→180 (+500%) is. (first<=0 ⇒ 0→N is a leak.)
+      // A leak grows step over step. Three things must hold:
+      // - the net climb dominates the worst backslide (not a bouncing series, e.g.
+      //   maplibre tile buffers reclaimed by GC),
+      // - the growth is a meaningful fraction of the baseline, not just past an
+      //   absolute floor (a +8 churn on a 1500 baseline isn't a leak; 30→180 is),
+      // - the growth is DISTRIBUTED across steps, not one jump (a single tile batch
+      //   loaded on the last pan, 44→44→44→44→125, is a one-off, not retention).
       const rel = values[0] > 0 ? growth / values[0] : Infinity;
+      const distributed =
+        maxStepInc <= 0.6 * growth &&
+        incCount >= Math.ceil((values.length - 1) / 2);
       const leak =
-        growth >= tm.floor && growth > 2 * maxDrop && rel >= 0.2;
-      if (!leak) continue; // only surface clean upward ramps; skip bouncing / churn
+        growth >= tm.floor && growth > 2 * maxDrop && rel >= 0.2 && distributed;
+      if (!leak) continue; // only surface sustained, distributed upward ramps
       trends.push({
         name: prefix,
         count: group.length,
