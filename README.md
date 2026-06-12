@@ -233,6 +233,42 @@ perf.setVitalsBudget({ LCP: 2500, INP: 200, CLS: 0.1 });
 
 It's gated the same way (median, with noisy warnings).
 
+### Regression gate (baseline-relative)
+
+Budgets are absolute bounds you maintain by hand. The other half of "drive the
+optimization" is catching a relative regression without declaring a number — *the
+PR made this step 35% slower than main*. Produce a baseline median set, then the
+current one, and diff them:
+
+```sh
+# baseline (e.g. on main)
+PERF_OUT_DIR=perf-baseline pnpm exec playwright test --repeat-each=5
+PERF_OUT_DIR=perf-baseline node node_modules/lightbringer/scripts/median.mjs
+
+# current (on the PR)
+pnpm exec playwright test --repeat-each=5
+node node_modules/lightbringer/scripts/median.mjs
+
+# fail if anything got >15% worse
+node node_modules/lightbringer/scripts/regress.mjs perf-baseline perf-results --threshold=0.15
+```
+
+```
+[regress] baseline perf-baseline  vs  current perf-results  (gate: +15%)
+
+  open-cart
+    increment-click / render.scriptMs  2.1 → 133.1  (+6238%)  ✗
+    increment-click / cpu.blockingMs    0   → 134    (new)     ✗
+    increment-click / memory.jsHeapUsedMB  23.9 → 50.4 (+111%) ✗
+    vitals.INP  24 → 152  (+533%)  ~
+```
+
+Every tracked metric is lower-is-better, so a regression is an increase past both
+the relative gate **and** an absolute floor (so a 1ms→2ms swing isn't flagged as
++100%). A metric that's noisy on either side (wide IQR) is downgraded to a warning
+(`~`) — the comparison can't be trusted, add runs. Exits non-zero on any hard
+regression, so it drops straight into CI alongside the budget gate.
+
 ## Accuracy
 
 Measured against a known busy-loop in a page-owned click handler (see
