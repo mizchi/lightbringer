@@ -1239,11 +1239,25 @@ function buildTrends(spans: SpanReport[]): MemoryTrend[] {
     for (const tm of TREND_METRICS) {
       const values = group.map((s) => round(tm.get(s.memory)));
       const growth = round(values[values.length - 1] - values[0]);
-      // count non-decreasing steps (tiny epsilon tolerates rounding jitter)
-      const ups = values.filter((v, i) => i > 0 && v >= values[i - 1] - 0.01).length;
-      const monotonic = ups >= values.length - 2; // allow a single dip
-      const leak = monotonic && growth >= tm.floor;
-      if (growth < tm.floor && !leak) continue; // only surface metrics that grew
+      // Worst single backslide. A real leak ramps up with only minor dips; a
+      // value that bounces (e.g. maplibre's tile buffers, reclaimed by GC between
+      // steps) has a backslide comparable to or larger than its net growth, even
+      // when the endpoints happen to be higher. Require the net climb to dominate
+      // the jitter — otherwise the +N is noise, not retention.
+      let maxDrop = 0;
+      for (let i = 1; i < values.length; i++) {
+        const drop = values[i - 1] - values[i];
+        if (drop > maxDrop) maxDrop = drop;
+      }
+      const monotonic = maxDrop <= 0.1 * Math.abs(growth);
+      // Relative gate: the growth must be a meaningful fraction of the baseline,
+      // not just past an absolute floor. A fixed floor mis-fires across apps —
+      // maplibre juggles ~1500 tile ArrayBuffers, so a churn of +8 (0.5%) isn't a
+      // leak, while a fixture going 30→180 (+500%) is. (first<=0 ⇒ 0→N is a leak.)
+      const rel = values[0] > 0 ? growth / values[0] : Infinity;
+      const leak =
+        growth >= tm.floor && growth > 2 * maxDrop && rel >= 0.2;
+      if (!leak) continue; // only surface clean upward ramps; skip bouncing / churn
       trends.push({
         name: prefix,
         count: group.length,
@@ -1401,16 +1415,14 @@ function logSummary(report: PerfReport): void {
     );
     const m = s.memory;
     const sign = (n: number) => (n >= 0 ? `+${n}` : `${n}`);
-    // Under PERF_MEM the deltas are post-GC (retained only); a step that retains
-    // both heap and listeners is the per-step leak shape. Without GC the deltas
-    // include the step's own uncollected garbage, so the hint would be noise.
-    const leakish = MEM_GC && m.jsHeapDeltaMB > 0 && m.listenersDelta > 0;
+    // A single span's delta is too noisy to call a leak (every initial load grows
+    // heap + listeners from zero). Leak verdicts come from the cross-step trend
+    // (measureRepeat → report.trends); here we just show the numbers.
     lines.push(
       `      mem   heap=${m.jsHeapUsedMB}MB (${sign(m.jsHeapDeltaMB)}MB)` +
         `  arraybufs=${m.arrayBuffers}  listeners=${m.jsEventListeners} (${sign(m.listenersDelta)})` +
         `  docs=${sign(m.documentsDelta)}  domNodes=${m.domNodes}` +
-        (MEM_GC ? "" : "  (pre-GC; set PERF_MEM=1 for retained-only deltas)") +
-        (leakish ? "  (retained heap+listeners grew — likely leak)" : ""),
+        (MEM_GC ? "" : "  (pre-GC; set PERF_MEM=1 for retained-only deltas)"),
     );
   }
   if (report.appSpans.length > 0) {
