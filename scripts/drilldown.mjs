@@ -337,3 +337,60 @@ if (initiators.length > 0) {
     );
   }
 }
+
+// --- CSS selector match cost (why style recalc is expensive) ---
+// SelectorStats events (disabled-by-default-blink.debug, i.e. PERF_CSS=1) carry
+// per-selector match stats for each recalc. Aggregating elapsed time names the
+// selectors that cost the recalc; match_attempts with match_count 0 are wasteful
+// selectors (re-tested against the DOM on every recalc but never match).
+const selAgg = new Map();
+for (const e of events) {
+  if (e.name !== "SelectorStats") continue;
+  if (e.ts != null && (e.ts < startUs || e.ts > endUs)) continue;
+  const timings = e.args?.selector_stats?.selector_timings ?? [];
+  for (const t of timings) {
+    const key = t.selector;
+    const cur = selAgg.get(key) ?? { us: 0, attempts: 0, rejects: 0, matches: 0 };
+    cur.us += t["elapsed (us)"] ?? 0;
+    cur.attempts += t.match_attempts ?? 0;
+    cur.rejects += t.fast_reject_count ?? 0;
+    cur.matches += t.match_count ?? 0;
+    selAgg.set(key, cur);
+  }
+}
+if (selAgg.size > 0) {
+  const all = [...selAgg.entries()].map(([selector, v]) => ({ selector, ...v }));
+  const totalUs = all.reduce((a, s) => a + s.us, 0);
+  console.log(
+    `\n  CSS selector match cost (${selAgg.size} selectors, ${round(totalUs / 1000)}ms total matching):`,
+  );
+  console.log(
+    `    note: PERF_CSS instruments every match attempt, so the recalc TIME is inflated` +
+      ` (this run's recalc=${span.render?.recalcStyleMs ?? "n/a"}ms). Use this to find WHICH` +
+      ` selectors; read recalcStyleMs from a normal run for the real magnitude.`,
+  );
+  const bySlow = [...all].sort((a, b) => b.us - a.us).slice(0, topN);
+  console.log(`    slowest selectors (match time):`);
+  for (const s of bySlow) {
+    console.log(
+      `      ${String(round(s.us / 1000)).padStart(7)}ms  attempts=${s.attempts}  matches=${s.matches}  ${s.selector}`,
+    );
+  }
+  // wasteful = many attempts, never matched -> dead weight on every recalc
+  const wasteful = all
+    .filter((s) => s.matches === 0 && s.attempts > 0)
+    .sort((a, b) => b.attempts - a.attempts)
+    .slice(0, topN);
+  if (wasteful.length > 0) {
+    console.log(`    wasteful selectors (attempts, never matched — candidates to delete/scope):`);
+    for (const s of wasteful) {
+      console.log(
+        `      ${String(s.attempts).padStart(7)} attempts  ${round(s.us / 1000)}ms  ${s.selector}`,
+      );
+    }
+  }
+} else if (span.render?.recalcStyleMs > 0) {
+  console.log(
+    `\n  CSS selector match cost: no SelectorStats in window (run with PERF_CSS=1 to see per-selector cost)`,
+  );
+}

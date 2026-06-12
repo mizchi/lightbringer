@@ -42,8 +42,16 @@ const WEB_VITALS_IIFE =
 
 const PERF_OUT_DIR = path.resolve(process.env.PERF_OUT_DIR ?? "perf-results");
 
-/** With PERF_TRACE=1, save a Chrome trace (openable in DevTools / Perfetto). */
-const TRACE_ENABLED = process.env.PERF_TRACE === "1";
+/**
+ * PERF_CSS=1 adds the `disabled-by-default-blink.debug` trace category, which
+ * makes Blink emit per-selector match stats (SelectorStats) on every style
+ * recalc — so the drilldown can show WHICH selectors cost the recalc time. It's
+ * expensive (instruments every match attempt), so it's opt-in and implies a trace.
+ */
+const CSS_STATS = process.env.PERF_CSS === "1";
+
+/** With PERF_TRACE=1 (or PERF_CSS=1), save a Chrome trace (openable in DevTools / Perfetto). */
+const TRACE_ENABLED = process.env.PERF_TRACE === "1" || CSS_STATS;
 
 /** PERF_CPU=N throttles the CPU N times (mid-tier device emulation). 1 = off. */
 const CPU_RATE = Number(process.env.PERF_CPU ?? "1");
@@ -230,6 +238,10 @@ export interface Budget {
   waves?: number;
   busyMs?: number;
   layoutCount?: number;
+  /** upper bound on style-recalc time (ms) — the selector-match cost of a step */
+  recalcStyleMs?: number;
+  /** upper bound on how many elements had style recalculated */
+  recalcStyleCount?: number;
   nodes?: number;
   /** upper bound on bytes loaded from third-party origins */
   thirdPartyKB?: number;
@@ -274,6 +286,8 @@ const BUDGET_METRIC: Record<keyof Budget, (s: SpanReport) => number> = {
   waves: (s) => s.network.waves,
   busyMs: (s) => s.network.busyMs,
   layoutCount: (s) => s.render.layoutCount,
+  recalcStyleMs: (s) => s.render.recalcStyleMs,
+  recalcStyleCount: (s) => s.render.recalcStyleCount,
   nodes: (s) => s.render.nodes,
   thirdPartyKB: (s) => s.network.thirdParty.encodedKB,
   thirdPartyRequestCount: (s) => s.network.thirdParty.requestCount,
@@ -378,6 +392,8 @@ export interface PerfReport {
   appSpans: AppSpanReport[];
   /** scenario-wide network total */
   network: NetworkReport;
+  /** page CSS/DOM capacity — the "why is style recalc expensive" denominator */
+  css?: CssProfile;
   /** WebGL renderer string; "SwiftShader" means software GL (GPU numbers are fake) */
   glRenderer?: string;
   /** uncaught page errors during measurement; non-empty means results are suspect */
@@ -387,6 +403,22 @@ export interface PerfReport {
   /** memory growth across repeated steps (from measureRepeat); leak signal */
   trends?: MemoryTrend[];
   tracePath?: string;
+}
+
+/**
+ * Page CSS/DOM capacity. Style recalc cost is roughly O(elements × selectors that
+ * survive fast-rejection), so a big DOM crossed with a big stylesheet is the
+ * structural cause of an expensive recalc. This is the denominator; PERF_CSS=1 +
+ * the drilldown's selector stats are the per-selector numerator.
+ */
+export interface CssProfile {
+  styleSheets: number;
+  /** total style rules across all same-origin sheets (recurses into @media) */
+  cssRules: number;
+  /** total selectors (comma-split selectorText) — the match-cost multiplier */
+  selectors: number;
+  /** live DOM element count */
+  domNodes: number;
 }
 
 /** Strategy that waits until the page has settled after an action. */
@@ -844,6 +876,8 @@ async function startTrace(
       "v8.execute",
       "gpu",
       "disabled-by-default-v8.cpu_profiler",
+      // per-selector style-recalc match stats (SelectorStats); opt-in, expensive
+      ...(CSS_STATS ? ["disabled-by-default-blink.debug"] : []),
     ].join(","),
   });
   return async () => {
@@ -1461,6 +1495,18 @@ function logSummary(report: PerfReport): void {
       );
     }
   }
+  if (report.css) {
+    const c = report.css;
+    // elements × selectors is the recalc-cost ceiling; flag when it's large
+    const heavy = c.domNodes * c.selectors > 5_000_000;
+    lines.push(
+      `  css   ${c.styleSheets} sheets / ${c.cssRules} rules / ${c.selectors} selectors` +
+        `  ×  ${c.domNodes} DOM nodes` +
+        (heavy
+          ? "  (large selector×DOM product — PERF_CSS=1 to see the costly selectors)"
+          : ""),
+    );
+  }
   lines.push(
     `  total network ${report.network.totalRequests} reqs / ${report.network.totalEncodedKB}KB`,
   );
@@ -1583,6 +1629,41 @@ export const test = base.extend<{ perf: PerfController }>({
         }
       })
       .catch(() => null);
+    // CSS/DOM capacity: the structural reason a style recalc is expensive
+    // (elements × selectors). Cross-origin sheets throw on cssRules and are skipped.
+    const css = await page
+      .evaluate(() => {
+        let cssRules = 0;
+        let selectors = 0;
+        let styleSheets = 0;
+        const walk = (rules: CSSRuleList) => {
+          for (const rule of Array.from(rules)) {
+            const sel = (rule as CSSStyleRule).selectorText;
+            if (sel) {
+              cssRules += 1;
+              selectors += sel.split(",").length;
+            }
+            const nested = (rule as CSSGroupingRule).cssRules;
+            if (nested) walk(nested);
+          }
+        };
+        for (const sheet of Array.from(document.styleSheets)) {
+          styleSheets += 1;
+          try {
+            walk(sheet.cssRules);
+          } catch {
+            /* cross-origin stylesheet — rules not readable */
+          }
+        }
+        return {
+          styleSheets,
+          cssRules,
+          selectors,
+          domNodes: document.getElementsByTagName("*").length,
+        };
+      })
+      .catch(() => undefined);
+
     const url = page.url();
     const reqs = finishNetwork();
     // finish the trace before buildReport so Paint/GPU can correlate to spans.
@@ -1604,6 +1685,7 @@ export const test = base.extend<{ perf: PerfController }>({
       renderEvents,
     );
 
+    if (css) report.css = css;
     if (glRenderer) report.glRenderer = glRenderer;
     if (pageErrors.length) report.pageErrors = pageErrors;
     if (Object.keys(controller.vitalsBudget).length > 0)

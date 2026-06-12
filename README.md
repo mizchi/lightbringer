@@ -55,7 +55,10 @@ Per **span** (one `perf.measure(name, action)` region):
   `Performance.getMetrics` cumulative counters), JS execution time; and, with
   `PERF_TRACE=1`, Paint count/time and **GPU task time** (`gpuMs`) from the trace.
   The drilldown rolls GPU work up per type (GPUTask / RasterTask / …) so a step
-  that's cheap on the main thread but GPU-bound is visible.
+  that's cheap on the main thread but GPU-bound is visible. `recalcStyleMs` is the
+  **CSS selector-match cost** of a step; the report's `css` profile (selectors ×
+  DOM nodes) is the structural cause, and `PERF_CSS=1` + the drilldown name the
+  individual costly / wasteful selectors.
 - **memory** — per-step memory *load* from `Performance.getMetrics` gauges:
   on-heap JS used + delta (`jsHeapUsedMB` / `jsHeapDeltaMB`), live ArrayBuffer
   count, retained DOM nodes, event-listener count + delta, and document delta. A
@@ -111,6 +114,7 @@ PERF_TRACE=1 pnpm exec playwright test          # also save a Chrome trace (Pain
 PERF_CPU=4 pnpm exec playwright test            # throttle CPU 4x (mid-tier device)
 PERF_GPU=1 pnpm exec playwright test            # hardware GL (real GPU/paint numbers)
 PERF_MEM=1 pnpm exec playwright test            # force GC at span boundaries (retained-only memory deltas)
+PERF_CSS=1 pnpm exec playwright test            # capture per-selector style-recalc match stats (in the trace)
 pnpm exec playwright test --repeat-each=5        # multiple runs for median
 node node_modules/lightbringer/scripts/median.mjs
 ```
@@ -162,6 +166,15 @@ pinpoints the actual hot function (e.g. a specific React render), with V8 synthe
 frames like `(idle)` / `(program)` filtered out — a **GPU** rollup (GPUTask /
 RasterTask), and **network initiators** (which code issued the span's requests,
 straight from the report, so it needs no trace).
+
+With `PERF_CSS=1` it also prints **CSS selector match cost** — per-selector style
+recalc stats (`disabled-by-default-blink.debug` SelectorStats): the slowest
+selectors by match time, and the *wasteful* ones (high `match_attempts`,
+`match_count` 0 — re-tested against the DOM on every recalc but never matching,
+prime candidates to delete or scope). This is the answer to "the DOM and selector
+count are large and style recalc is expensive — which selectors?". Note `PERF_CSS`
+instruments every match attempt, so it **inflates** the recalc time; use it to find
+*which* selectors and read `recalcStyleMs` from a normal run for the real magnitude.
 
 ### App spans (`withSpan`)
 
@@ -260,8 +273,8 @@ Either way, violations are also printed in the per-run summary (`! budget: ...`)
 
 Span budget fields: `durationMs`, `scriptMs`, `blockingMs`, `encodedKB`,
 `requestCount`, `waves`, `busyMs`, `thirdPartyKB`, `thirdPartyRequestCount`,
-`layoutCount`, `nodes`, `jsHeapUsedMB`, `jsHeapDeltaMB`, `listenersDelta`,
-`paintCount` / `paintMs` / `gpuMs` (PERF_TRACE only). The memory bounds
+`layoutCount`, `recalcStyleMs`, `recalcStyleCount`, `nodes`, `jsHeapUsedMB`,
+`jsHeapDeltaMB`, `listenersDelta`, `paintCount` / `paintMs` / `gpuMs` (PERF_TRACE only). The memory bounds
 (`jsHeapDeltaMB` especially) are only trustworthy under `PERF_MEM=1`; prefer the
 count-based `listenersDelta` for a GC-stable gate. For page-global web-vitals,
 declare a separate budget once per test:
@@ -428,6 +441,7 @@ regression fixture for the tool. `?fixed` (or `BENCH_FIXED=1`) toggles the fix.
 | thirdparty | analytics / ad / tag-manager scripts from another origin | `network.thirdParty` (KB / reqs / CPU) | 4 reqs / 265 KB / 70 ms CPU → 0 | drop / defer / self-host the script |
 | leak | each click retains objects / buffers / listeners forever | `memory.listenersDelta` / `arrayBuffers` (PERF_MEM) | +19 listeners / +30 buffers → ~0 | drop refs, unbind listeners |
 | leak-trend | the same leak, repeated 6× via `measureRepeat` | `report.trends` (PERF_MEM) | heap +9.2 MB/step monotonic → flat | drop refs, unbind listeners |
+| selector-cost | big DOM × many matching complex selectors; toggle restyles all | `render.recalcStyleMs` (+ `PERF_CSS` drilldown) | ~22 → 0.5 ms | fewer / flatter / scoped selectors |
 
 `stress` is different: it doesn't measure an app bottleneck, it stresses
 lightbringer's own data handling — 600 concurrent requests + a 150k-mark trace

@@ -405,6 +405,49 @@ function Leak({ fixed }: { fixed: boolean }) {
   );
 }
 
+// Scenario 14: CSS selector match cost. A big DOM crossed with many complex,
+// mostly-non-matching selectors makes style recalc O(elements × selectors).
+// Clicking toggles a class on the container, invalidating styles so the whole
+// subtree is recalculated — re-running every selector against every element.
+// slow: 4000 elements + 1500 complex descendant/attribute/:nth-child selectors
+// that rarely match (high match_attempts, match_count 0). fixed: 300 elements +
+// a couple of flat class selectors. Lights up render.recalcStyleMs; with
+// PERF_CSS=1 the drilldown names the costly / wasteful selectors.
+function SelectorCost({ fixed }: { fixed: boolean }) {
+  const [on, setOn] = useState(false);
+  const n = fixed ? 300 : 4000;
+  const css = useMemo(() => {
+    if (fixed) return ".item{color:#333}.wrap.on .item{color:#06c}";
+    // Selectors that actually MATCH (so matching walks the combinator chain instead
+    // of being fast-rejected at the rightmost) and are re-evaluated against the
+    // whole subtree when `.on` is toggled. Compound `div[data-k].cN` matches the
+    // item divs, ` span` descends to their span — real O(elements × selectors) work.
+    let s = ".wrap .item span{color:#333}";
+    for (let i = 0; i < 2000; i++) {
+      s += `.wrap.on div[data-k="${i % 50}"].c${i % 80} span:not(.none){color:rgb(${i % 255},${i % 100},0)}`;
+    }
+    return s;
+  }, [fixed]);
+  return (
+    <main>
+      {/* eslint-disable-next-line react/no-danger */}
+      <style>{css}</style>
+      <h1>selector-cost {fixed ? "(fixed)" : "(slow)"}</h1>
+      <button id="restyle" type="button" onClick={() => setOn((v) => !v)}>
+        restyle
+      </button>
+      <div id="status">{on ? "on" : "off"}</div>
+      <div className={`wrap ${on ? "on" : ""}`}>
+        {Array.from({ length: n }, (_, i) => (
+          <div key={i} data-k={i % 50} className={`c${i % 80} item`}>
+            <span>{i}</span>
+          </div>
+        ))}
+      </div>
+    </main>
+  );
+}
+
 // ===========================================================================
 // Initialization bucket: resource problems on the scenario's initial load.
 // Each shows a "ready" marker only once init is done, so the initial-load span
@@ -511,6 +554,8 @@ export function App() {
       return <Stress fixed={fixed} />;
     case "leak":
       return <Leak fixed={fixed} />;
+    case "selector-cost":
+      return <SelectorCost fixed={fixed} />;
     default:
       return <Rerender fixed={fixed} />;
   }

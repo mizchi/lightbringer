@@ -60,6 +60,7 @@ const SPAN_METRICS = [
   { key: "waves", label: "network.waves", get: (s) => s.network?.waves, floor: 1 },
   { key: "thirdPartyKB", label: "network.thirdPartyKB", get: (s) => s.network?.thirdPartyKB, floor: 10 },
   { key: "layoutCount", label: "render.layoutCount", get: (s) => s.render?.layoutCount, floor: 5 },
+  { key: "recalcStyleMs", label: "render.recalcStyleMs", get: (s) => s.render?.recalcStyleMs, floor: 2 },
   { key: "nodes", label: "render.nodes", get: (s) => s.render?.nodes, floor: 50 },
   { key: "gpuMs", label: "render.gpuMs", get: (s) => s.render?.gpuMs, floor: 2 },
   { key: "paintCount", label: "render.paintCount", get: (s) => s.render?.paintCount, floor: 10 },
