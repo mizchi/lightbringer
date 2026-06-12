@@ -315,6 +315,32 @@ export interface VitalsBudget {
   FCP?: number;
 }
 
+/**
+ * Growth of a memory metric across repeated runs of the SAME step (the `#0..#N`
+ * spans emitted by measureRepeat). Per-step deltas are GC-noisy, but a value that
+ * climbs monotonically every time you repeat the same operation is the real leak
+ * signal — and it stays inside one scenario, so it isn't the out-of-scope
+ * cross-scenario analysis. Most trustworthy under PERF_MEM=1 (retained-only).
+ */
+export interface MemoryTrend {
+  /** the repeated step name (the shared prefix of the `#i` spans) */
+  name: string;
+  /** number of repeats */
+  count: number;
+  /** which memory gauge: jsHeapUsedMB | jsEventListeners | domNodes | arrayBuffers */
+  metric: string;
+  /** the metric's absolute value at the end of each repeat */
+  values: number[];
+  /** last - first */
+  growth: number;
+  /** growth per repeat */
+  perStep: number;
+  /** value never (meaningfully) dropped across the repeats */
+  monotonic: boolean;
+  /** monotonic AND grew past the metric's floor — flagged as a likely leak */
+  leak: boolean;
+}
+
 export interface PerfReport {
   title: string;
   url: string;
@@ -332,6 +358,8 @@ export interface PerfReport {
   pageErrors?: string[];
   /** true if the in-page collector never ran (e.g. page.setContent without a goto) */
   collectorMissing?: boolean;
+  /** memory growth across repeated steps (from measureRepeat); leak signal */
+  trends?: MemoryTrend[];
   tracePath?: string;
 }
 
@@ -581,6 +609,27 @@ export class PerfController {
       traceEndUs: (after.Timestamp ?? 0) * 1e6,
       budget: opts.budget,
     });
+  }
+
+  /**
+   * Repeat the same operation N times, each recorded as a `${name}#${i}` span.
+   * buildReport then checks whether memory (heap / listeners / DOM nodes /
+   * ArrayBuffers) climbs monotonically across the repeats — the real leak signal,
+   * which a single per-step delta can't separate from GC noise. Use PERF_MEM=1 so
+   * each repeat's memory is measured after a forced GC (retained-only).
+   */
+  async measureRepeat(
+    name: string,
+    action: () => Promise<void>,
+    opts: { times?: number; settle?: Settle; budget?: Budget } = {},
+  ): Promise<void> {
+    const times = opts.times ?? 3;
+    for (let i = 0; i < times; i++) {
+      await this.measure(`${name}#${i}`, action, {
+        settle: opts.settle,
+        budget: opts.budget,
+      });
+    }
   }
 
   /** Run settle but give up after SETTLE_TIMEOUT_MS. Returns true if it capped. */
@@ -1054,6 +1103,63 @@ function buildSpanCpu(
   };
 }
 
+/** Memory gauges tracked for cross-step growth; floor = min growth to call a leak. */
+const TREND_METRICS: Array<{
+  key: string;
+  get: (m: SpanMemory) => number;
+  floor: number;
+}> = [
+  { key: "jsHeapUsedMB", get: (m) => m.jsHeapUsedMB, floor: 2 },
+  { key: "jsEventListeners", get: (m) => m.jsEventListeners, floor: 10 },
+  { key: "domNodes", get: (m) => m.domNodes, floor: 50 },
+  { key: "arrayBuffers", get: (m) => m.arrayBuffers, floor: 5 },
+];
+
+const repeatIndex = (name: string): number => {
+  const m = /#(\d+)$/.exec(name);
+  return m ? Number(m[1]) : -1;
+};
+
+/**
+ * Detect monotonic memory growth across the `${name}#${i}` spans of a measureRepeat.
+ * A metric is reported only when it grows past its floor; `leak` is set when that
+ * growth is also monotonic (the value didn't meaningfully drop between repeats).
+ */
+function buildTrends(spans: SpanReport[]): MemoryTrend[] {
+  const groups = new Map<string, SpanReport[]>();
+  for (const s of spans) {
+    const m = /^(.*)#(\d+)$/.exec(s.name);
+    if (!m) continue;
+    const prefix = m[1];
+    (groups.get(prefix) ?? groups.set(prefix, []).get(prefix)!).push(s);
+  }
+  const trends: MemoryTrend[] = [];
+  for (const [prefix, group] of groups) {
+    if (group.length < 3) continue; // too few points to call a trend
+    group.sort((a, b) => repeatIndex(a.name) - repeatIndex(b.name));
+    for (const tm of TREND_METRICS) {
+      const values = group.map((s) => round(tm.get(s.memory)));
+      const growth = round(values[values.length - 1] - values[0]);
+      // count non-decreasing steps (tiny epsilon tolerates rounding jitter)
+      const ups = values.filter((v, i) => i > 0 && v >= values[i - 1] - 0.01).length;
+      const monotonic = ups >= values.length - 2; // allow a single dip
+      const leak = monotonic && growth >= tm.floor;
+      if (growth < tm.floor && !leak) continue; // only surface metrics that grew
+      trends.push({
+        name: prefix,
+        count: group.length,
+        metric: tm.key,
+        values,
+        growth,
+        perStep: round(growth / (group.length - 1)),
+        monotonic,
+        leak,
+      });
+    }
+  }
+  return trends;
+}
+
 function buildReport(
   testInfo: TestInfo,
   url: string,
@@ -1130,6 +1236,8 @@ function buildReport(
     },
   );
 
+  const trends = buildTrends(spanReports);
+
   return {
     title: testInfo.title,
     url,
@@ -1137,6 +1245,7 @@ function buildReport(
     spans: spanReports,
     appSpans,
     network: buildGlobalNetwork(reqs, firstPartyDomain),
+    ...(trends.length ? { trends } : {}),
   };
 }
 
@@ -1208,6 +1317,27 @@ function logSummary(report: PerfReport): void {
       lines.push(
         `${indent}${s.name} ${round(s.durationMs)}ms` +
           `  net=${s.network.busyMs}ms/${s.network.encodedKB}KB  cpu=${s.cpu.blockingMs}ms`,
+      );
+    }
+  }
+  if (report.trends && report.trends.length > 0) {
+    lines.push("  memory trends (across repeated steps):");
+    for (const t of report.trends) {
+      const unit = t.metric === "jsHeapUsedMB" ? "MB" : "";
+      const series = t.values.join("→");
+      const flag = t.leak
+        ? "  ⚠ likely leak"
+        : t.monotonic
+          ? "  (monotonic)"
+          : "";
+      lines.push(
+        `    ${t.name} x${t.count}  ${t.metric} ${series}${unit}` +
+          `  ${t.growth >= 0 ? "+" : ""}${t.growth}${unit} (${t.perStep >= 0 ? "+" : ""}${t.perStep}/step)${flag}`,
+      );
+    }
+    if (!MEM_GC) {
+      lines.push(
+        "    (deltas include uncollected garbage; PERF_MEM=1 for a retained-only trend)",
       );
     }
   }

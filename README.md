@@ -62,6 +62,10 @@ Per **span** (one `perf.measure(name, action)` region):
   the deltas after `HeapProfiler.collectGarbage`, i.e. retained memory only). Note
   byte-level buffer / GPU memory is not observable via CDP — only the ArrayBuffer
   *count* is, so binary / GPU-staging memory shows as a climbing count, not bytes.
+  Repeat a step with `perf.measureRepeat(name, action, { times })` and lightbringer
+  reports whether memory climbs monotonically across the repeats (`report.trends`,
+  flagged `⚠ likely leak`) — the reliable leak signal, since repeating averages out
+  the single-step GC noise.
 
 All times are unified to epoch ms so spans correlate with network / CPU even
 across navigations.
@@ -186,6 +190,36 @@ await perf.measure("pan-map", async () => { /* ... */ }, {
 Settle is bounded by `PERF_SETTLE_TIMEOUT` (default 5000ms). If it times out the
 span is flagged `capped` and its `durationMs` should not be trusted (read the
 network / CPU / render breakdown instead).
+
+### Memory leak trend (`measureRepeat`)
+
+A single step's memory delta can't be told apart from GC noise. To catch a leak,
+repeat the same operation and watch whether memory climbs every time:
+
+```ts
+await perf.measureRepeat(
+  "toggle-panel",
+  async () => {
+    await page.getByRole("button", { name: "Toggle" }).click();
+  },
+  { times: 6 },
+);
+```
+
+Each repeat is recorded as a `toggle-panel#0..#5` span; lightbringer then reports
+whether the heap / listener count / DOM nodes / ArrayBuffer count grow
+monotonically across them:
+
+```
+  memory trends (across repeated steps):
+    toggle-panel x6  jsEventListeners 192→212→232→252→272→292  +100 (+20/step)  ⚠ likely leak
+    toggle-panel x6  jsHeapUsedMB 12→21.2→30.4→39.6→48.8→58MB  +46MB (+9.2/step)  ⚠ likely leak
+```
+
+Run it under `PERF_MEM=1` so each repeat's memory is measured after a forced GC
+(retained-only) — that's what makes even `jsHeapUsedMB` resolve into a clean line.
+A non-leaking step reports no trend. This stays inside one scenario, so it isn't
+the out-of-scope cross-scenario analysis.
 
 ## Budgets (CI regression gate)
 
@@ -382,6 +416,7 @@ regression fixture for the tool. `?fixed` (or `BENCH_FIXED=1`) toggles the fix.
 | paint | animating box-shadow every frame (no layout) | `render.paintCount` (PERF_TRACE) | 196 paints → 4 | animate `transform` (compositor-only) |
 | thirdparty | analytics / ad / tag-manager scripts from another origin | `network.thirdParty` (KB / reqs / CPU) | 4 reqs / 265 KB / 70 ms CPU → 0 | drop / defer / self-host the script |
 | leak | each click retains objects / buffers / listeners forever | `memory.listenersDelta` / `arrayBuffers` (PERF_MEM) | +19 listeners / +30 buffers → ~0 | drop refs, unbind listeners |
+| leak-trend | the same leak, repeated 6× via `measureRepeat` | `report.trends` (PERF_MEM) | heap +9.2 MB/step monotonic → flat | drop refs, unbind listeners |
 
 `stress` is different: it doesn't measure an app bottleneck, it stresses
 lightbringer's own data handling — 600 concurrent requests + a 150k-mark trace
