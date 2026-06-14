@@ -386,6 +386,45 @@ the relative gate **and** an absolute floor (so a 1ms→2ms swing isn't flagged 
 (`~`) — the comparison can't be trusted, add runs. Exits non-zero on any hard
 regression, so it drops straight into CI alongside the budget gate.
 
+## CI
+
+[`.github/workflows/perf.yml`](.github/workflows/perf.yml) is a working perf gate —
+lightbringer measuring its own fixtures — that doubles as the copy-this template:
+
+```yaml
+- run: pnpm exec playwright install --with-deps chromium
+- run: pnpm exec playwright test <your-specs> --repeat-each=5   # median needs N runs
+- run: node node_modules/lightbringer/scripts/median.mjs        # exits 1 on budget violation
+```
+
+Two things make it reliable in CI:
+
+- **Gate on the median, not a single run.** `--repeat-each=5` + `median.mjs`
+  absorbs JIT/GC/cache noise and prints `median (p25..p75)`; a metric whose IQR is
+  wide is flagged `!noisy` and shouldn't gate.
+- **CI runners have no GPU** (SwiftShader), so budget the main-thread metrics
+  (`scriptMs`, `layoutCount`, `nodes`, `requestCount`, `waves`, `recalcStyleMs`) —
+  not `gpuMs`/`paintMs`, which are unreliable there.
+
+To add the **baseline-relative regress gate** (catch "this PR got 15% slower than
+main" without hand-set budgets), measure both revisions and diff:
+
+```yaml
+- run: pnpm exec playwright test <specs> --repeat-each=5
+- run: node scripts/median.mjs            # current → perf-results/*.median.json
+- name: baseline from main
+  run: |
+    git worktree add ../base origin/main
+    cd ../base && pnpm install --frozen-lockfile
+    pnpm exec playwright test <specs> --repeat-each=5
+    PERF_OUT_DIR="$PWD/perf-results" node scripts/median.mjs
+- run: node scripts/regress.mjs ../base/perf-results perf-results --threshold=0.15
+```
+
+The bench specs here default to their *slow* path (to demonstrate each metric), so
+the template passes `BENCH_FIXED=1` to run the optimized path and stay green —
+your own specs won't need that.
+
 ## Accuracy
 
 Measured against a known busy-loop in a page-owned click handler (see
