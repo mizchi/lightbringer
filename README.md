@@ -571,6 +571,32 @@ lightbringer's own data handling — 600 concurrent requests + a 150k-mark trace
 batch larger than the spread-call argument limit and streams the trace to disk
 instead of OOMing. Run it with `PERF_TRACE=1`.
 
+### Production fixture (build-dependent metrics)
+
+Some axes only produce real numbers against a **production build** — a dev server
+ships unbundled modules (no chunks), injects CSS via JS (no render-blocking
+`<link>`), and the bench fixtures use `data:` images (0 bytes). `fixtures/bundle`
+is a separate Vite project, built and `vite preview`-served by
+`playwright.bundle.config.ts`, that makes them concrete:
+
+```sh
+PERF_COV=1 pnpm test:bundle      # build → preview → measure with coverage
+pnpm coverage                    # union the per-scenario coverage
+```
+
+It surfaces, with real numbers:
+
+- **chunk coverage** — `vendor-react` ~23% used (a big framework chunk the app
+  barely exercises), and a `features` chunk imported as a namespace and dispatched
+  dynamically, so it's shipped whole but ~25% used (the over-shipping pathology).
+- **render-blocking** — the extracted `<link rel=stylesheet>` (1 css).
+- **media over-fetch with real bytes** — a generated 1600×1200 PNG shown at
+  128×96 (≈150× over-fetch, ~46 KB), not a 0-byte `data:` URL.
+- **CSS coverage** — `style.css` has matching and non-matching rules, so CSS lands
+  ~25% used.
+
+The PNG is generated (`pnpm bundle:gen`, gitignored) so no binary is committed.
+
 Notes worth internalizing:
 
 - `reflow` / `init-reflow`: `scriptMs` is only ~5–8 ms, so a CPU-only view misses

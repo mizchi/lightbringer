@@ -35,11 +35,15 @@
     "prepublishOnly": "tsup src/index.ts --format esm --dts --clean",
     "test": "playwright test",
     "test:unit": "vitest run",
+    "test:bundle": "playwright test -c playwright.bundle.config.ts",
+    "bundle:gen": "node fixtures/bundle/gen-image.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "oxlint",
     "fix": "oxlint --fix",
     "median": "node scripts/median.mjs",
-    "drilldown": "node scripts/drilldown.mjs"
+    "drilldown": "node scripts/drilldown.mjs",
+    "regress": "node scripts/regress.mjs",
+    "coverage": "node scripts/coverage.mjs"
   },
   "dependencies": {
     "web-vitals": "^5.0.0"

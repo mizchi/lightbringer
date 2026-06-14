@@ -14,6 +14,8 @@ const origin = `http://localhost:${port}`;
 
 export default defineConfig({
   testDir: "./examples",
+  // the bundle fixture is a production build measured by playwright.bundle.config.ts
+  testIgnore: "**/bundle/**",
   // perf measurement must be serial; parallel workers contend for CPU/GPU.
   workers: 1,
   fullyParallel: false,

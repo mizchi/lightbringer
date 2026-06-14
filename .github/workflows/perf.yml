@@ -44,3 +44,27 @@ jobs:
           code=${PIPESTATUS[0]}
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           exit "$code"
+
+  # Production-build fixture: chunk coverage / render-blocking / real-byte
+  # over-fetch. Informational (coverage isn't a budget) — surfaced in the summary.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
+      - name: measure production build with coverage
+        env:
+          PERF_COV: "1"
+        run: pnpm exec playwright test -c playwright.bundle.config.ts
+      - name: coverage union
+        shell: bash
+        run: |
+          { echo '## bundle coverage'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          node scripts/coverage.mjs 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
