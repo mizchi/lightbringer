@@ -39,9 +39,15 @@ listener gauges and their per-step delta), not as a retained-graph diff.
 Per **span** (one `perf.measure(name, action)` region):
 
 - **web-vitals (attribution build)** — LCP / INP / CLS / TTFB / FCP with attribution.
+  LCP is broken into its sub-parts (TTFB / resource load delay / load duration /
+  **render delay**) so you can see whether it's server-, resource-, or render-bound,
+  and `report.renderBlocking` lists the `<head>` stylesheets / parser-blocking
+  scripts standing between navigation and first paint.
 - **network** (CDP) — request count, transferred KB, `busyMs` (union of request
   intervals = how long the network was actually busy), and `waves` (approximate
-  serial-dependency depth of the waterfall). Each request also carries its
+  serial-dependency depth of the waterfall), and how many requests were served
+  from cache (`fromCacheCount` — disk / memory / prefetch / SW, no network fetch).
+  Each request also carries its
   **initiator** (the code or parser that issued it); `network.byInitiator` rolls
   them up so a deep waterfall points straight at the responsible function
   (`get  /App.tsx:244 (6)`) — the network-side analogue of the CPU drilldown.
@@ -56,6 +62,11 @@ Per **span** (one `perf.measure(name, action)` region):
   one page-global worst INP; this tells you which step was janky and why (e.g. a
   toggle whose 80 ms is almost all presentation = the repaint after it, not the
   handler). `interactionMs` is budgetable.
+- **frames** (animation smoothness) — a rAF probe records frame cadence, so each
+  span reports effective fps, dropped frames (gaps ≥ one 60 Hz frame), and the
+  worst hitch (`longestFrameMs`). The render metrics say how much paint/GPU work;
+  this says whether it rendered smoothly. `droppedFrames` / `longestFrameMs` are
+  budgetable.
 - **render** — style recalc / layout count and time (from CDP
   `Performance.getMetrics` cumulative counters), JS execution time; and, with
   `PERF_TRACE=1`, Paint count/time and **GPU task time** (`gpuMs`) from the trace.
@@ -327,8 +338,8 @@ Either way, violations are also printed in the per-run summary (`! budget: ...`)
 Span budget fields: `durationMs`, `scriptMs`, `blockingMs`, `encodedKB`,
 `requestCount`, `waves`, `busyMs`, `thirdPartyKB`, `thirdPartyRequestCount`,
 `layoutCount`, `recalcStyleMs`, `recalcStyleCount`, `nodes`, `jsHeapUsedMB`,
-`jsHeapDeltaMB`, `listenersDelta`, `interactionMs`, `paintCount` / `paintMs` /
-`gpuMs` (PERF_TRACE only). The memory bounds
+`jsHeapDeltaMB`, `listenersDelta`, `interactionMs`, `droppedFrames`,
+`longestFrameMs`, `paintCount` / `paintMs` / `gpuMs` (PERF_TRACE only). The memory bounds
 (`jsHeapDeltaMB` especially) are only trustworthy under `PERF_MEM=1`; prefer the
 count-based `listenersDelta` for a GC-stable gate. For page-global web-vitals,
 declare a separate budget once per test:
@@ -468,6 +479,15 @@ Things that bite, learned from the accuracy probe:
   chunks a real CDN would compress — confirm against production hosting.
 - **Per-span interaction** uses Event Timing with a 16 ms `durationThreshold`, so
   sub-16 ms (already-responsive) interactions don't appear — absence is good news.
+- **Frames** come from a rAF probe, so dropped frames are measured against a 60 Hz
+  budget (16.7 ms) even though headless Chromium runs unthrottled (~120 fps) — a
+  smooth span simply reports no hitch. The probe pushes one timestamp per frame
+  (negligible), and the summary only prints the line when there's a real hitch.
+- **Cache hits** are detected within the run (memory/disk/SW); a true reload-diff
+  ("what's re-fetched on a second visit") means navigating twice in the scenario.
+- **Render-blocking** counts `<head>` stylesheets and classic (non-async/defer,
+  non-module) `<script src>`; a single app CSS bundle showing as 1 blocking sheet
+  is normal — the signal is unexpected extra blocking resources.
 - **`PERF_PORT` overrides the fixture dev-server port** (default 5173). Set it to a
   free port when another Vite project is already on 5173 — otherwise Playwright
   reuses that server and silently measures the wrong app.

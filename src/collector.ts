@@ -191,6 +191,22 @@ export interface SpanInteraction {
   presentationMs: number;
 }
 
+/**
+ * Frame cadence during a span (animation smoothness), from a rAF probe. A static
+ * span sits near display refresh with no drops; a janky pan/scroll shows dropped
+ * frames and a long worst-frame. The量-side render metrics (paint/gpu) say how
+ * much work; this says whether it actually rendered smoothly.
+ */
+export interface SpanFrames {
+  count: number;
+  /** missed display frames (each gap counts floor(gap/16.7)-1) */
+  droppedFrames: number;
+  /** longest gap between frames (ms) — the worst hitch */
+  longestFrameMs: number;
+  /** effective frames per second over the span */
+  fps: number;
+}
+
 /** CPU breakdown of a span (CPU bottleneck analysis). */
 export interface SpanCpu {
   longTaskCount: number;
@@ -292,6 +308,10 @@ export interface Budget {
   listenersDelta?: number;
   /** upper bound on the worst interaction latency in the span (per-step INP, ms) */
   interactionMs?: number;
+  /** upper bound on dropped frames in the span (animation jank) */
+  droppedFrames?: number;
+  /** upper bound on the worst frame gap in the span (ms) */
+  longestFrameMs?: number;
 }
 
 export interface SpanReport {
@@ -306,6 +326,8 @@ export interface SpanReport {
   memory: SpanMemory;
   /** responsiveness of interactions in the span (per-step INP); absent if none */
   interaction?: SpanInteraction;
+  /** frame cadence during the span (animation smoothness); absent if too few frames */
+  frames?: SpanFrames;
   /** span window in trace clock (monotonic μs). Used by the drilldown script. */
   traceWindowUs: [number, number];
   /** declared budget, if any (carried into the report so the median gate can read it) */
@@ -334,6 +356,8 @@ const BUDGET_METRIC: Record<keyof Budget, (s: SpanReport) => number> = {
   jsHeapDeltaMB: (s) => s.memory.jsHeapDeltaMB,
   listenersDelta: (s) => s.memory.listenersDelta,
   interactionMs: (s) => s.interaction?.maxDurationMs ?? 0,
+  droppedFrames: (s) => s.frames?.droppedFrames ?? 0,
+  longestFrameMs: (s) => s.frames?.longestFrameMs ?? 0,
 };
 
 /** Budget violations on a single run (actual > budget). */
@@ -381,6 +405,8 @@ export interface NetworkReport {
   thirdParty: ThirdPartyBreakdown;
   /** scenario-wide request issuers (which code / parser issued the most requests) */
   byInitiator: InitiatorStat[];
+  /** requests served from cache (disk / memory / prefetch / SW) — no network fetch */
+  fromCacheCount: number;
 }
 
 /** Upper bounds on page-global web-vitals (gated on the median, like span budgets). */
@@ -435,6 +461,8 @@ export interface PerfReport {
   coverage?: Coverage;
   /** image over-fetch + uncompressed-resource analysis */
   media?: MediaReport;
+  /** render-blocking resources in <head> (delay first paint / LCP) */
+  renderBlocking?: RenderBlocking;
   /** WebGL renderer string; "SwiftShader" means software GL (GPU numbers are fake) */
   glRenderer?: string;
   /** uncaught page errors during measurement; non-empty means results are suspect */
@@ -507,6 +535,18 @@ export interface MediaReport {
   uncompressed: Array<{ url: string; kb: number; ratio: number; type: string }>;
 }
 
+/**
+ * Render-blocking resources in <head>: stylesheets (the parser waits for CSSOM
+ * before first paint) and parser-blocking classic scripts (no async/defer, not a
+ * module). These push out first paint / LCP. Pair with the LCP attribution
+ * sub-parts (TTFB / load delay / load duration / render delay) to see whether LCP
+ * is server-bound, resource-bound, or render-bound.
+ */
+export interface RenderBlocking {
+  stylesheets: string[];
+  scripts: string[];
+}
+
 /** Strategy that waits until the page has settled after an action. */
 export type Settle = (page: Page) => Promise<void>;
 
@@ -559,6 +599,8 @@ interface PerfWindow {
       processingStart: number;
       processingEnd: number;
     }>;
+    /** requestAnimationFrame timestamps (DOMHighResTimeStamp) — frame cadence */
+    frames: number[];
     /** drain pending PerformanceObserver records into the store (see flush below) */
     flush?: () => void;
   };
@@ -566,8 +608,17 @@ interface PerfWindow {
 
 function browserCollector() {
   const w = window as unknown as PerfWindow;
-  w.__perf = { vitals: {}, longTasks: [], loaf: [], measures: [], events: [] };
+  w.__perf = { vitals: {}, longTasks: [], loaf: [], measures: [], events: [], frames: [] };
   const store = w.__perf;
+
+  // Record frame cadence with a self-rescheduling rAF. Each callback just pushes
+  // a timestamp (negligible work), so the gap between frames reflects the page's
+  // own jank, not the probe. A gap >> 16.7ms means dropped frames.
+  const onFrame = (t: number) => {
+    store.frames.push(t);
+    requestAnimationFrame(onFrame);
+  };
+  requestAnimationFrame(onFrame);
 
   const record = (m: BrowserMetric) => {
     store.vitals[m.name] = m;
@@ -862,6 +913,8 @@ interface NetReq {
   endEpochMs?: number;
   encoded?: number;
   initiator?: Initiator;
+  /** served from disk / memory / prefetch / service-worker cache (no network fetch) */
+  fromCache?: boolean;
 }
 
 /** CDP initiator shape (only the fields we read). */
@@ -931,9 +984,30 @@ async function startNetworkCapture(
     });
   });
   client.on("Network.responseReceived", (e) => {
-    const p = e as unknown as { requestId: string; type?: string };
+    const p = e as unknown as {
+      requestId: string;
+      type?: string;
+      response?: {
+        fromDiskCache?: boolean;
+        fromPrefetchCache?: boolean;
+        fromServiceWorker?: boolean;
+      };
+    };
     const r = reqs.get(p.requestId);
-    if (r && p.type) r.type = p.type;
+    if (!r) return;
+    if (p.type) r.type = p.type;
+    if (
+      p.response?.fromDiskCache ||
+      p.response?.fromPrefetchCache ||
+      p.response?.fromServiceWorker
+    )
+      r.fromCache = true;
+  });
+  // memory-cache hits don't carry a response body; they fire this instead
+  client.on("Network.requestServedFromCache", (e) => {
+    const p = e as unknown as { requestId: string };
+    const r = reqs.get(p.requestId);
+    if (r) r.fromCache = true;
   });
   client.on("Network.loadingFinished", (e) => {
     const p = e as unknown as {
@@ -1225,6 +1299,7 @@ function buildGlobalNetwork(
     slowest: finished.slice(0, 8),
     thirdParty: buildThirdParty(tpRecords, firstPartyDomain),
     byInitiator: buildInitiators(tpRecords),
+    fromCacheCount: reqs.filter((r) => r.fromCache).length,
   };
 }
 
@@ -1425,12 +1500,18 @@ function buildTrends(spans: SpanReport[]): MemoryTrend[] {
       // - the growth is DISTRIBUTED across steps, not one jump (a single tile batch
       //   loaded on the last pan, 44→44→44→44→125, is a one-off, not retention).
       const rel = values[0] > 0 ? growth / values[0] : Infinity;
+      // and the back half must keep growing — a series that ramps then plateaus
+      // (maplibre warming its tile cache: 11→21→27→27.6) is allocation that
+      // levels off, not an unbounded leak.
+      const mid = Math.floor(values.length / 2);
+      const secondHalfGrowth = values[values.length - 1] - values[mid];
       const distributed =
         maxStepInc <= 0.6 * growth &&
-        incCount >= Math.ceil((values.length - 1) / 2);
+        incCount >= Math.ceil((values.length - 1) / 2) &&
+        secondHalfGrowth >= 0.25 * growth;
       const leak =
         growth >= tm.floor && growth > 2 * maxDrop && rel >= 0.2 && distributed;
-      if (!leak) continue; // only surface sustained, distributed upward ramps
+      if (!leak) continue; // only surface sustained, distributed, non-plateauing ramps
       trends.push({
         name: prefix,
         count: group.length,
@@ -1621,6 +1702,32 @@ function buildSpanInteraction(
   };
 }
 
+/** Frame cadence inside the span window (16.7ms = one 60Hz frame). */
+function buildSpanFrames(
+  span: EpochWindow,
+  frameEpochs: number[],
+): SpanFrames | undefined {
+  const inWindow = frameEpochs
+    .filter((t) => t >= span.startEpochMs && t <= span.endEpochMs)
+    .sort((a, b) => a - b);
+  if (inWindow.length < 2) return undefined;
+  let dropped = 0;
+  let longest = 0;
+  for (let i = 1; i < inWindow.length; i++) {
+    const dt = inWindow[i] - inWindow[i - 1];
+    if (dt > longest) longest = dt;
+    const missed = Math.round(dt / 16.67) - 1;
+    if (missed > 0) dropped += missed;
+  }
+  const seconds = (inWindow[inWindow.length - 1] - inWindow[0]) / 1000;
+  return {
+    count: inWindow.length,
+    droppedFrames: dropped,
+    longestFrameMs: round(longest),
+    fps: seconds > 0 ? round((inWindow.length - 1) / seconds) : 0,
+  };
+}
+
 function buildReport(
   testInfo: TestInfo,
   url: string,
@@ -1662,6 +1769,7 @@ function buildReport(
     processingStart: e.processingStart,
     processingEnd: e.processingEnd,
   }));
+  const frameEpochs = (raw.frames ?? []).map((t) => timeOrigin + t);
 
   const spanReports: SpanReport[] = spans.map((s) => {
     const render = renderEvents
@@ -1679,6 +1787,7 @@ function buildReport(
       render,
       memory: s.memory,
       interaction: buildSpanInteraction(s, events),
+      frames: buildSpanFrames(s, frameEpochs),
       traceWindowUs: [s.traceStartUs, s.traceEndUs],
       budget: s.budget,
     };
@@ -1726,6 +1835,33 @@ function logSummary(report: PerfReport): void {
   lines.push(
     `  vitals  LCP=${fmt(v.LCP)}  INP=${fmt(v.INP)}  CLS=${fmt(v.CLS)}  TTFB=${fmt(v.TTFB)}`,
   );
+  // LCP sub-parts (where the LCP time goes) + render-blocking resources behind it.
+  const lcpAttr = v.LCP?.attribution as
+    | {
+        timeToFirstByte?: number;
+        resourceLoadDelay?: number;
+        resourceLoadDuration?: number;
+        elementRenderDelay?: number;
+        element?: string;
+      }
+    | undefined;
+  if (lcpAttr && (lcpAttr.timeToFirstByte != null || lcpAttr.elementRenderDelay != null)) {
+    const r = (n?: number) => round(n ?? 0);
+    lines.push(
+      `    lcp ttfb=${r(lcpAttr.timeToFirstByte)} / load-delay=${r(lcpAttr.resourceLoadDelay)}` +
+        ` / load=${r(lcpAttr.resourceLoadDuration)} / render-delay=${r(lcpAttr.elementRenderDelay)}ms` +
+        (lcpAttr.element ? `  <${String(lcpAttr.element).slice(0, 40)}>` : ""),
+    );
+  }
+  if (report.renderBlocking) {
+    const rb = report.renderBlocking;
+    lines.push(
+      `    render-blocking: ${rb.stylesheets.length} css, ${rb.scripts.length} js` +
+        (rb.stylesheets.length || rb.scripts.length
+          ? `  [${[...rb.stylesheets, ...rb.scripts].slice(0, 3).map(shortenUrl).join(", ")}]`
+          : ""),
+    );
+  }
   for (const s of report.spans) {
     lines.push(
       `  ${s.name.padEnd(26)} ${String(s.durationMs).padStart(7)}ms${s.capped ? " (capped)" : ""}`,
@@ -1766,6 +1902,13 @@ function logSummary(report: PerfReport): void {
       lines.push(
         `      inp   ${it.type}=${it.maxDurationMs}ms  (input ${it.inputDelayMs} / proc ${it.processingMs} / present ${it.presentationMs})` +
           (it.count > 1 ? `  ${it.count} interactions` : ""),
+      );
+    }
+    // only surface frames when there's actually a hitch (static spans sit at ~60fps)
+    if (s.frames && (s.frames.droppedFrames > 0 || s.frames.longestFrameMs > 33)) {
+      const f = s.frames;
+      lines.push(
+        `      frames ${f.fps}fps  ${f.droppedFrames} dropped  longest=${f.longestFrameMs}ms`,
       );
     }
     const r = s.render;
@@ -1872,7 +2015,10 @@ function logSummary(report: PerfReport): void {
     cov("css", report.coverage.css);
   }
   lines.push(
-    `  total network ${report.network.totalRequests} reqs / ${report.network.totalEncodedKB}KB`,
+    `  total network ${report.network.totalRequests} reqs / ${report.network.totalEncodedKB}KB` +
+      (report.network.fromCacheCount > 0
+        ? `  (${report.network.fromCacheCount} from cache)`
+        : ""),
   );
   const gtp = report.network.thirdParty;
   if (gtp.requestCount > 0) {
@@ -2134,6 +2280,38 @@ export const test = base.extend<{ perf: PerfController }>({
       })
       .catch(() => undefined);
 
+    // Render-blocking resources in <head>: stylesheets + parser-blocking scripts.
+    const renderBlocking = await page
+      .evaluate(() => {
+        const stylesheets: string[] = [];
+        const scripts: string[] = [];
+        const head = document.head;
+        if (head) {
+          for (const link of Array.from(
+            head.querySelectorAll<HTMLLinkElement>("link[rel~=stylesheet]"),
+          )) {
+            if (link.hasAttribute("disabled")) continue;
+            const media = (link.getAttribute("media") || "all").toLowerCase();
+            // only media that applies to the screen blocks the initial render
+            if (media === "all" || media === "screen" || media === "")
+              stylesheets.push(link.getAttribute("href") || "");
+          }
+          for (const s of Array.from(
+            head.querySelectorAll<HTMLScriptElement>("script[src]"),
+          )) {
+            // async/defer and type=module (deferred by default) don't block parsing
+            if (
+              !s.hasAttribute("async") &&
+              !s.hasAttribute("defer") &&
+              (s.getAttribute("type") || "") !== "module"
+            )
+              scripts.push(s.getAttribute("src") || "");
+          }
+        }
+        return { stylesheets, scripts };
+      })
+      .catch(() => undefined);
+
     const url = page.url();
     const reqs = finishNetwork();
     // finish the trace before buildReport so Paint/GPU can correlate to spans.
@@ -2148,7 +2326,7 @@ export const test = base.extend<{ perf: PerfController }>({
     const report = buildReport(
       testInfo,
       url,
-      raw ?? { vitals: {}, longTasks: [], loaf: [], measures: [], events: [] },
+      raw ?? { vitals: {}, longTasks: [], loaf: [], measures: [], events: [], frames: [] },
       timeOrigin,
       controller.spans,
       reqs,
@@ -2156,6 +2334,8 @@ export const test = base.extend<{ perf: PerfController }>({
     );
 
     if (css) report.css = css;
+    if (renderBlocking && (renderBlocking.stylesheets.length || renderBlocking.scripts.length))
+      report.renderBlocking = renderBlocking;
     if (media && (media.oversized.length || media.uncompressed.length || media.imageCount))
       report.media = media;
     if (coverage) report.coverage = coverage;

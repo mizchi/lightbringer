@@ -67,6 +67,8 @@ const SPAN_METRICS = [
   { key: "jsHeapUsedMB", label: "memory.jsHeapUsedMB", get: (s) => s.memory?.jsHeapUsedMB, floor: 1 },
   { key: "jsEventListeners", label: "memory.jsEventListeners", get: (s) => s.memory?.jsEventListeners, floor: 10 },
   { key: "interactionMs", label: "interaction.maxDurationMs", get: (s) => s.interaction?.maxDurationMs, floor: 16 },
+  { key: "droppedFrames", label: "frames.droppedFrames", get: (s) => s.frames?.droppedFrames, floor: 2 },
+  { key: "longestFrameMs", label: "frames.longestFrameMs", get: (s) => s.frames?.longestFrameMs, floor: 16 },
 ];
 
 const VITAL_METRICS = [

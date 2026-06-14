@@ -129,6 +129,13 @@ function aggregateSlug(slug, runs) {
             presentationMs: statBy(items, (s) => s.interaction?.presentationMs ?? 0),
           }
         : undefined,
+      frames: items.some((s) => s.frames)
+        ? {
+            droppedFrames: statBy(items, (s) => s.frames?.droppedFrames ?? 0),
+            longestFrameMs: statBy(items, (s) => s.frames?.longestFrameMs ?? 0),
+            fps: statBy(items, (s) => s.frames?.fps ?? 0),
+          }
+        : undefined,
       budget,
     };
   });
@@ -181,6 +188,8 @@ const STAT_OF = {
   jsHeapDeltaMB: (s) => s.memory?.jsHeapDeltaMB,
   listenersDelta: (s) => s.memory?.listenersDelta,
   interactionMs: (s) => s.interaction?.maxDurationMs,
+  droppedFrames: (s) => s.frames?.droppedFrames,
+  longestFrameMs: (s) => s.frames?.longestFrameMs,
 };
 
 /**
@@ -249,6 +258,11 @@ function printSummary(agg) {
     if (s.interaction) {
       lines.push(
         `      inp    ${fmt(s.interaction.maxDurationMs)}ms  (input ${fmt(s.interaction.inputDelayMs)} / proc ${fmt(s.interaction.processingMs)} / present ${fmt(s.interaction.presentationMs)})`,
+      );
+    }
+    if (s.frames && (s.frames.droppedFrames.median > 0 || s.frames.longestFrameMs.median > 33)) {
+      lines.push(
+        `      frames ${fmt(s.frames.fps)}fps  dropped=${fmt(s.frames.droppedFrames)}  longest=${fmt(s.frames.longestFrameMs)}ms`,
       );
     }
     const r = s.render;
