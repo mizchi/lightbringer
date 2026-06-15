@@ -20,6 +20,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./auto": {
+      "types": "./dist/auto.d.ts",
+      "default": "./dist/auto.js"
     }
   },
   "files": [
@@ -34,8 +38,8 @@
     "lightbringer-coverage": "scripts/coverage.mjs"
   },
   "scripts": {
-    "build": "tsup src/index.ts src/cli.ts --format esm --dts --clean",
-    "prepublishOnly": "tsup src/index.ts src/cli.ts --format esm --dts --clean",
+    "build": "tsup src/index.ts src/cli.ts src/auto.ts --format esm --dts --clean",
+    "prepublishOnly": "tsup src/index.ts src/cli.ts src/auto.ts --format esm --dts --clean",
     "test": "playwright test",
     "test:unit": "vitest run",
     "test:bundle": "playwright test -c playwright.bundle.config.ts",

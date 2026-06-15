@@ -170,6 +170,28 @@ Reports are written to `perf-results/<title>.run<idx>.json` and a summary is
 logged. Put your `waitFor`/`expect` assertions **inside** the action so the span
 covers "until the operation is done".
 
+### Auto-span (measure an existing spec, ~1-line change)
+
+To put numbers on a spec you already have, without wrapping anything in
+`perf.measure`, import `test` / `expect` from `lightbringer/auto` instead of
+`@playwright/test`:
+
+```diff
+- import { test, expect } from "@playwright/test";
++ import { test, expect } from "lightbringer/auto";
+```
+
+Every navigation and interaction in the spec body — `page.goto(...)` and Locator
+actions like `getByRole(...).click()`, `locator(...).fill(...)` — becomes a
+measured span automatically (labelled `goto /`, `click #inc`, …). The spec body is
+otherwise unchanged. The same `perf-results/*.json` is written and the same PERF_*
+flags apply.
+
+Trade-off vs. explicit `perf.measure`: each auto-span covers **one action's own
+cost** (the action plus a short settle), not "until your next assertion". When you
+need the "until settled" window (e.g. goto **and** wait for the hero to paint as
+one span), use the explicit `test` from `lightbringer` and `perf.measure`.
+
 ```sh
 pnpm exec playwright test                       # measure
 PERF_TRACE=1 pnpm exec playwright test          # also save a Chrome trace (Paint / GPU / drilldown)

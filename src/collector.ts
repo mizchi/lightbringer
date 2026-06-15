@@ -808,16 +808,16 @@ export class PerfController {
    * action so the span covers "until the operation is done", then its
    * network / CPU / render breakdown can be correlated afterwards.
    */
-  async measure(
+  async measure<T>(
     name: string,
-    action: () => Promise<void>,
+    action: () => Promise<T>,
     opts: { settle?: Settle; budget?: Budget } = {},
-  ): Promise<void> {
+  ): Promise<T> {
     const startEpochMs = await this.now();
     // With PERF_MEM, GC before the baseline so the delta starts from a clean heap.
     if (this.memGc) await this.gc();
     const before = await this.metrics();
-    await action();
+    const result = await action();
     const capped = await this.runSettle(opts.settle ?? this.settle);
     const endEpochMs = await this.now();
     const after = await this.metrics();
@@ -840,6 +840,7 @@ export class PerfController {
       traceEndUs: (after.Timestamp ?? 0) * 1e6,
       budget: opts.budget,
     });
+    return result;
   }
 
   /**
