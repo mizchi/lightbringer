@@ -1,7 +1,7 @@
 {
   "name": "lightbringer",
-  "version": "0.1.0",
-  "description": "Per-step resource measurement for Playwright scenarios: network / CPU / render / INP at initialization and between steps, to optimize a scenario's resource usage. Median regression gate and trace drilldown.",
+  "version": "0.2.0",
+  "description": "Per-step web performance measurement for Playwright: network / CPU / render / INP / memory / coverage at initialization and between steps. Use the test fixture, or the zero-config CLI that runs a JSON scenario and emits budgets. Median regression gate and trace drilldown.",
   "type": "module",
   "license": "MIT",
   "author": "mizchi",
@@ -27,12 +27,15 @@
     "scripts"
   ],
   "bin": {
+    "lightbringer": "dist/cli.js",
     "lightbringer-median": "scripts/median.mjs",
-    "lightbringer-drilldown": "scripts/drilldown.mjs"
+    "lightbringer-drilldown": "scripts/drilldown.mjs",
+    "lightbringer-regress": "scripts/regress.mjs",
+    "lightbringer-coverage": "scripts/coverage.mjs"
   },
   "scripts": {
-    "build": "tsup src/index.ts --format esm --dts --clean",
-    "prepublishOnly": "tsup src/index.ts --format esm --dts --clean",
+    "build": "tsup src/index.ts src/cli.ts --format esm --dts --clean",
+    "prepublishOnly": "tsup src/index.ts src/cli.ts --format esm --dts --clean",
     "test": "playwright test",
     "test:unit": "vitest run",
     "test:bundle": "playwright test -c playwright.bundle.config.ts",
@@ -46,6 +49,7 @@
     "coverage": "node scripts/coverage.mjs"
   },
   "dependencies": {
+    "playwright": "^1.59.0",
     "web-vitals": "^5.0.0"
   },
   "peerDependencies": {

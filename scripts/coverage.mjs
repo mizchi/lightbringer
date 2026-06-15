@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 /**
  * Union JS/CSS coverage across every scenario run to find code that NO scenario
  * used — dead-code / over-shipping candidates — and to judge whether chunks are

@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 /**
  * Drill down into one span: aggregate the trace within the span window to find
  * which subsystem / function spends CPU. A generic way to locate the cause of a

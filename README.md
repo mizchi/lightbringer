@@ -101,7 +101,44 @@ Per **span** (one `perf.measure(name, action)` region):
 All times are unified to epoch ms so spans correlate with network / CPU even
 across navigations.
 
-## Install
+## CLI (no install, no spec)
+
+The fastest way to try it: no dependency to add, no test file to write. Describe
+the scenario as JSON and run it with `npx` / `pnpm dlx`. Each step becomes one
+measured span.
+
+```jsonc
+// scenario.json
+{
+  "url": "http://localhost:5173",
+  "viewport": { "width": 1280, "height": 800 },
+  "steps": [
+    { "name": "initial-load", "goto": "/", "waitFor": "#app" },
+    { "name": "open-cart", "click": "text=Cart", "waitFor": "[role=dialog]" },
+    { "name": "pan", "drag": ".map", "by": [-240, -160] }
+  ]
+}
+```
+
+```sh
+pnpm dlx lightbringer run scenario.json                 # measure, print the breakdown
+pnpm dlx lightbringer run scenario.json --gpu --cov     # real GPU + chunk coverage
+pnpm dlx lightbringer run scenario.json --repeat 5 --emit-budgets   # write budgets from the medians
+pnpm dlx lightbringer run scenario.json --repeat 5 --gate           # fail if a median exceeds them
+```
+
+`--emit-budgets` derives `lightbringer.budgets.json` from the measured medians
+(×1.25 headroom) — **you never hand-write a number** — and `--gate` fails the run
+against it. Step fields: `goto`, `click`, `fill`+`text`, `press`, `drag`+`by`,
+`waitFor`, `wait`, and a per-step `settle` (`networkidle` (default) / `load` /
+`raf` / a number of ms). Flags: `--repeat N`, `--out DIR`, `--gpu`, `--cpu N`,
+`--net slow-3g|fast-3g|4g`, `--cov`, `--mem`, `--css`, `--trace`, `--headed`.
+
+The CLI bundles Playwright; the browser binary is the only prerequisite
+(`npx playwright install chromium`). For CI integration or app-code spans, use the
+test fixture below instead.
+
+## Install (test fixture)
 
 ```sh
 pnpm add -D lightbringer @playwright/test

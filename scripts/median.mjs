@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 /**
  * Aggregate multiple run reports (perf-results/<slug>.run*.json) into a median
  * with min..max per span / app span / vital.

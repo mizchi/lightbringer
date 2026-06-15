@@ -1,12 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
-import {
-  test as base,
-  type CDPSession,
-  type Page,
-  type TestInfo,
-} from "@playwright/test";
+// Type-only import (erased at build) so the core has no @playwright/test runtime
+// dependency — the CLI can drive it with a plain `playwright` page. The fixture
+// (src/fixture.ts) is what actually imports @playwright/test's test runner.
+import type { CDPSession, Page } from "playwright";
 import { toOtelSpans, type OtelSpan } from "./otel";
 
 // ---------------------------------------------------------------------------
@@ -40,7 +38,7 @@ const WEB_VITALS_IIFE =
     "utf8",
   ) + "\n;globalThis.webVitals=webVitals;";
 
-const PERF_OUT_DIR = path.resolve(process.env.PERF_OUT_DIR ?? "perf-results");
+export const PERF_OUT_DIR = path.resolve(process.env.PERF_OUT_DIR ?? "perf-results");
 
 /**
  * PERF_CSS=1 adds the `disabled-by-default-blink.debug` trace category, which
@@ -48,7 +46,7 @@ const PERF_OUT_DIR = path.resolve(process.env.PERF_OUT_DIR ?? "perf-results");
  * recalc — so the drilldown can show WHICH selectors cost the recalc time. It's
  * expensive (instruments every match attempt), so it's opt-in and implies a trace.
  */
-const CSS_STATS = process.env.PERF_CSS === "1";
+export const CSS_STATS = process.env.PERF_CSS === "1";
 
 /**
  * PERF_COV=1 records JS + CSS coverage across the whole scenario
@@ -58,13 +56,13 @@ const CSS_STATS = process.env.PERF_CSS === "1";
  * scenarios, scripts/coverage.mjs unions the used ranges to find code no scenario
  * touched (dead-code / over-shipping candidates). Chromium-only; expensive.
  */
-const COV_ENABLED = process.env.PERF_COV === "1";
+export const COV_ENABLED = process.env.PERF_COV === "1";
 
 /** With PERF_TRACE=1 (or PERF_CSS=1), save a Chrome trace (openable in DevTools / Perfetto). */
-const TRACE_ENABLED = process.env.PERF_TRACE === "1" || CSS_STATS;
+export const TRACE_ENABLED = process.env.PERF_TRACE === "1" || CSS_STATS;
 
 /** PERF_CPU=N throttles the CPU N times (mid-tier device emulation). 1 = off. */
-const CPU_RATE = Number(process.env.PERF_CPU ?? "1");
+export const CPU_RATE = Number(process.env.PERF_CPU ?? "1");
 
 /**
  * PERF_MEM=1 forces a GC (HeapProfiler.collectGarbage) at each span boundary so
@@ -72,7 +70,7 @@ const CPU_RATE = Number(process.env.PERF_CPU ?? "1");
  * not-yet-collected garbage from the step itself. Off by default because the GC
  * adds wall time to the span (it would distort durationMs / settle timing).
  */
-const MEM_GC = process.env.PERF_MEM === "1";
+export const MEM_GC = process.env.PERF_MEM === "1";
 
 /** Max time to wait for settle before marking a span capped (ms). */
 const SETTLE_TIMEOUT_MS = Number(process.env.PERF_SETTLE_TIMEOUT ?? "5000");
@@ -89,7 +87,7 @@ const NET_PROFILES: Record<
   "fast-3g": { latency: 150, downloadThroughput: 196_608, uploadThroughput: 98_304 },
   "4g": { latency: 40, downloadThroughput: 1_179_648, uploadThroughput: 589_824 },
 };
-const NET_PROFILE = NET_PROFILES[process.env.PERF_NET ?? ""];
+export const NET_PROFILE = NET_PROFILES[process.env.PERF_NET ?? ""];
 
 // ---------------------------------------------------------------------------
 // Report types (the contract layer)
@@ -361,7 +359,7 @@ const BUDGET_METRIC: Record<keyof Budget, (s: SpanReport) => number> = {
 };
 
 /** Budget violations on a single run (actual > budget). */
-function checkBudgets(report: PerfReport): string[] {
+export function checkBudgets(report: PerfReport): string[] {
   const out: string[] = [];
   for (const s of report.spans) {
     if (!s.budget) continue;
@@ -795,6 +793,8 @@ export class PerfController {
     private page: Page,
     private client: CDPSession,
     private settle: Settle = defaultSettle,
+    /** force a GC at span boundaries so memory deltas are retained-only (PERF_MEM) */
+    private memGc: boolean = MEM_GC,
   ) {}
 
   /** Declare upper bounds on web-vitals (LCP / INP / CLS / TTFB / FCP) for this test. */
@@ -815,7 +815,7 @@ export class PerfController {
   ): Promise<void> {
     const startEpochMs = await this.now();
     // With PERF_MEM, GC before the baseline so the delta starts from a clean heap.
-    if (MEM_GC) await this.gc();
+    if (this.memGc) await this.gc();
     const before = await this.metrics();
     await action();
     const capped = await this.runSettle(opts.settle ?? this.settle);
@@ -824,7 +824,7 @@ export class PerfController {
     // Memory uses a post-GC end snapshot under PERF_MEM (retained-only); render and
     // timing keep the un-GC'd `after` so the GC pause doesn't distort them.
     let memAfter = after;
-    if (MEM_GC) {
+    if (this.memGc) {
       await this.gc();
       memAfter = await this.metrics();
     }
@@ -1032,6 +1032,7 @@ async function startNetworkCapture(
 async function startTrace(
   client: CDPSession,
   tracePath: string,
+  cssStats: boolean = CSS_STATS,
 ): Promise<() => Promise<{ renderEvents: TraceEvent[] }>> {
   // A heavy page emits tens-to-hundreds of MB of trace events. Holding them all
   // in a JS array and JSON.stringify-ing at the end peaks at 2x that in heap and
@@ -1077,7 +1078,7 @@ async function startTrace(
       "gpu",
       "disabled-by-default-v8.cpu_profiler",
       // per-selector style-recalc match stats (SelectorStats); opt-in, expensive
-      ...(CSS_STATS ? ["disabled-by-default-blink.debug"] : []),
+      ...(cssStats ? ["disabled-by-default-blink.debug"] : []),
     ].join(","),
   });
   return async () => {
@@ -1729,7 +1730,7 @@ function buildSpanFrames(
 }
 
 function buildReport(
-  testInfo: TestInfo,
+  title: string,
   url: string,
   raw: NonNullable<PerfWindow["__perf"]>,
   timeOrigin: number,
@@ -1818,7 +1819,7 @@ function buildReport(
   const trends = buildTrends(spanReports);
 
   return {
-    title: testInfo.title,
+    title,
     url,
     vitals,
     spans: spanReports,
@@ -1828,7 +1829,7 @@ function buildReport(
   };
 }
 
-function logSummary(report: PerfReport): void {
+export function logSummary(report: PerfReport, memGc: boolean = MEM_GC): void {
   const lines: string[] = [`\n[perf] ${report.title}`];
   const v = report.vitals;
   const fmt = (s?: VitalSample) => (s ? `${s.value} (${s.rating})` : "n/a");
@@ -1929,7 +1930,7 @@ function logSummary(report: PerfReport): void {
       `      mem   heap=${m.jsHeapUsedMB}MB (${sign(m.jsHeapDeltaMB)}MB)` +
         `  arraybufs=${m.arrayBuffers}  listeners=${m.jsEventListeners} (${sign(m.listenersDelta)})` +
         `  docs=${sign(m.documentsDelta)}  domNodes=${m.domNodes}` +
-        (MEM_GC ? "" : "  (pre-GC; set PERF_MEM=1 for retained-only deltas)"),
+        (memGc ? "" : "  (pre-GC; set PERF_MEM=1 for retained-only deltas)"),
     );
   }
   if (report.appSpans.length > 0) {
@@ -1962,7 +1963,7 @@ function logSummary(report: PerfReport): void {
           `  ${t.growth >= 0 ? "+" : ""}${t.growth}${unit} (${t.perStep >= 0 ? "+" : ""}${t.perStep}/step)${flag}`,
       );
     }
-    if (!MEM_GC) {
+    if (!memGc) {
       lines.push(
         "    (deltas include uncollected garbage; PERF_MEM=1 for a retained-only trend)",
       );
@@ -2061,70 +2062,223 @@ function logSummary(report: PerfReport): void {
 // fixture
 // ---------------------------------------------------------------------------
 
-export const test = base.extend<{ perf: PerfController }>({
-  perf: async ({ page }, use, testInfo) => {
-    await page.addInitScript({ content: WEB_VITALS_IIFE });
-    await page.addInitScript(browserCollector);
+// ---------------------------------------------------------------------------
+// Reusable measurement session. Works with any Playwright Page + CDPSession, so
+// the collection logic isn't tied to @playwright/test — the fixture below and the
+// CLI driver (src/cli.ts) both build on it.
+// ---------------------------------------------------------------------------
 
-    // Capture uncaught errors: a broken / stale build (e.g. a reused dev server
-    // serving an old bundle) typically throws, which makes the measurement invalid.
-    const pageErrors: string[] = [];
-    page.on("pageerror", (e) => pageErrors.push(String(e)));
+export interface SessionOptions {
+  /** CPU throttling multiplier (1 = off) */
+  cpuRate?: number;
+  /** network emulation profile (bytes/s, ms), or null for none */
+  netProfile?: {
+    latency: number;
+    downloadThroughput: number;
+    uploadThroughput: number;
+  } | null;
+  /** add per-selector SelectorStats to the trace (requires trace) */
+  cssStats?: boolean;
+  /** capture a Chrome trace, streamed to tracePath */
+  trace?: boolean;
+  /** where to stream the trace (required when trace is true) */
+  tracePath?: string;
+  /** record JS/CSS coverage across the scenario */
+  coverage?: boolean;
+  /** force a GC at span boundaries (retained-only memory deltas) */
+  memGc?: boolean;
+}
 
-    // Scale the test timeout under CPU throttling: a page that runs N times slower
-    // makes fixed waitFor / navigation timeouts trip. (The expect() timeout is a
-    // global config and can't be changed per-test at runtime — raise it in config
-    // or pass an explicit timeout when throttling hard.)
-    if (CPU_RATE > 1 && testInfo.timeout > 0) {
-      testInfo.setTimeout(testInfo.timeout * CPU_RATE);
+export interface PerfSession {
+  controller: PerfController;
+  /** uncaught page errors observed during the run */
+  pageErrors: string[];
+  /** finalize: gather everything and build the report (`title` labels it) */
+  finish: (title: string) => Promise<{
+    report: PerfReport;
+    covArtifact?: CoverageArtifact;
+  }>;
+}
+
+/** The browser-side eval bodies, shared verbatim by finish(). */
+function readGlRenderer(): string | null {
+  try {
+    const gl = document.createElement("canvas").getContext("webgl");
+    if (!gl) return null;
+    const ext = gl.getExtension("WEBGL_debug_renderer_info");
+    return ext
+      ? (gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) as string)
+      : (gl.getParameter(gl.RENDERER) as string);
+  } catch {
+    return null;
+  }
+}
+function readCssProfile(): CssProfile {
+  let cssRules = 0;
+  let selectors = 0;
+  let styleSheets = 0;
+  const walk = (rules: CSSRuleList) => {
+    for (const rule of Array.from(rules)) {
+      const sel = (rule as CSSStyleRule).selectorText;
+      if (sel) {
+        cssRules += 1;
+        selectors += sel.split(",").length;
+      }
+      const nested = (rule as CSSGroupingRule).cssRules;
+      if (nested) walk(nested);
     }
-
-    const client = await page.context().newCDPSession(page);
-    await client.send("Performance.enable");
-    // PERF_CPU=N slows the CPU N times (mid-tier device emulation). GL/GPU is not
-    // throttled, so this surfaces JS / render bottlenecks hidden on a fast machine.
-    if (CPU_RATE > 1) {
-      await client.send("Emulation.setCPUThrottlingRate", { rate: CPU_RATE });
+  };
+  for (const sheet of Array.from(document.styleSheets)) {
+    styleSheets += 1;
+    try {
+      walk(sheet.cssRules);
+    } catch {
+      /* cross-origin stylesheet — rules not readable */
     }
-    const finishNetwork = await startNetworkCapture(client);
-    // PERF_NET emulates a slower network so payload / waterfall costs are realistic.
-    if (NET_PROFILE) {
-      await client.send("Network.emulateNetworkConditions", {
-        offline: false,
-        ...NET_PROFILE,
+  }
+  return {
+    styleSheets,
+    cssRules,
+    selectors,
+    domNodes: document.getElementsByTagName("*").length,
+  };
+}
+function readMedia(): MediaReport {
+  const res = performance.getEntriesByType(
+    "resource",
+  ) as PerformanceResourceTiming[];
+  const byUrl = new Map(res.map((r) => [r.name, r]));
+  const dpr = window.devicePixelRatio || 1;
+  let imageCount = 0;
+  let imageBytes = 0;
+  const oversized: MediaReport["oversized"] = [];
+  for (const img of Array.from(document.images)) {
+    const url = img.currentSrc || img.src;
+    const nW = img.naturalWidth;
+    const nH = img.naturalHeight;
+    if (!url || !nW || !nH) continue;
+    imageCount += 1;
+    const r = byUrl.get(url);
+    const bytes = r ? r.encodedBodySize || r.transferSize || 0 : 0;
+    imageBytes += bytes;
+    const rect = img.getBoundingClientRect();
+    const rW = Math.round(rect.width);
+    const rH = Math.round(rect.height);
+    if (rW > 0 && rH > 0) {
+      const overFetch = (nW * nH) / (rW * rH * dpr * dpr);
+      if (overFetch >= 4) {
+        oversized.push({
+          url,
+          naturalPx: `${nW}x${nH}`,
+          renderedPx: `${rW}x${rH}`,
+          overFetch: Math.round(overFetch * 10) / 10,
+          kb: Math.round(bytes / 102.4) / 10,
+        });
+      }
+    }
+  }
+  oversized.sort((a, b) => b.kb - a.kb);
+  const textType = new Set([
+    "script",
+    "link",
+    "css",
+    "fetch",
+    "xmlhttprequest",
+    "other",
+  ]);
+  const uncompressed: MediaReport["uncompressed"] = [];
+  for (const r of res) {
+    if (!textType.has(r.initiatorType)) continue;
+    const enc = r.encodedBodySize;
+    const dec = r.decodedBodySize;
+    if (!enc || !dec || enc < 20_000) continue; // skip tiny / cross-origin (no TAO)
+    const ratio = dec / enc;
+    if (ratio < 1.1) {
+      uncompressed.push({
+        url: r.name,
+        kb: Math.round(enc / 102.4) / 10,
+        ratio: Math.round(ratio * 100) / 100,
+        type: r.initiatorType,
       });
     }
+  }
+  uncompressed.sort((a, b) => b.kb - a.kb);
+  return {
+    imageCount,
+    imageKB: Math.round(imageBytes / 102.4) / 10,
+    oversized: oversized.slice(0, 10),
+    uncompressed: uncompressed.slice(0, 10),
+  };
+}
+function readRenderBlocking(): RenderBlocking {
+  const stylesheets: string[] = [];
+  const scripts: string[] = [];
+  const head = document.head;
+  if (head) {
+    for (const link of Array.from(
+      head.querySelectorAll<HTMLLinkElement>("link[rel~=stylesheet]"),
+    )) {
+      if (link.hasAttribute("disabled")) continue;
+      const m = (link.getAttribute("media") || "all").toLowerCase();
+      if (m === "all" || m === "screen" || m === "")
+        stylesheets.push(link.getAttribute("href") || "");
+    }
+    for (const s of Array.from(
+      head.querySelectorAll<HTMLScriptElement>("script[src]"),
+    )) {
+      if (
+        !s.hasAttribute("async") &&
+        !s.hasAttribute("defer") &&
+        (s.getAttribute("type") || "") !== "module"
+      )
+        scripts.push(s.getAttribute("src") || "");
+    }
+  }
+  return { stylesheets, scripts };
+}
 
-    // Output paths are derived from testInfo (stable at setup), so the trace can
-    // stream to disk during the run instead of being buffered and written at the
-    // end. Full title path avoids collisions across describe blocks / looped tests.
-    const slug = testInfo.titlePath
-      .filter(Boolean)
-      .join("_")
-      .replace(/[^\p{L}\p{N}_]+/gu, "_");
-    // run index keeps files from colliding under --repeat-each=N (median aggregates <slug>.run*.json).
-    const runTag = `run${testInfo.repeatEachIndex}`;
-    const tracePath = path.join(PERF_OUT_DIR, `${slug}.${runTag}.trace.json`);
-    if (TRACE_ENABLED) fs.mkdirSync(PERF_OUT_DIR, { recursive: true });
-    const finishTrace = TRACE_ENABLED
-      ? await startTrace(client, tracePath)
+export async function startSession(
+  page: Page,
+  client: CDPSession,
+  opts: SessionOptions = {},
+): Promise<PerfSession> {
+  const cpuRate = opts.cpuRate ?? 1;
+  const memGc = opts.memGc ?? MEM_GC;
+
+  await page.addInitScript({ content: WEB_VITALS_IIFE });
+  await page.addInitScript(browserCollector);
+
+  // A broken / stale build typically throws; capture it so the report can warn.
+  const pageErrors: string[] = [];
+  page.on("pageerror", (e) => pageErrors.push(String(e)));
+
+  await client.send("Performance.enable");
+  if (cpuRate > 1)
+    await client.send("Emulation.setCPUThrottlingRate", { rate: cpuRate });
+  const finishNetwork = await startNetworkCapture(client);
+  if (opts.netProfile) {
+    await client.send("Network.emulateNetworkConditions", {
+      offline: false,
+      ...opts.netProfile,
+    });
+  }
+  const finishTrace =
+    opts.trace && opts.tracePath
+      ? await startTrace(client, opts.tracePath, opts.cssStats ?? CSS_STATS)
       : undefined;
+  // Coverage spans the whole scenario (resetOnNavigation:false). Chromium-only.
+  if (opts.coverage && page.coverage) {
+    await page.coverage.startJSCoverage({
+      resetOnNavigation: false,
+      reportAnonymousScripts: false,
+    });
+    await page.coverage.startCSSCoverage({ resetOnNavigation: false });
+  }
 
-    // Coverage spans the whole scenario (resetOnNavigation:false) so it accrues
-    // across every goto/interaction. Chromium-only; guard on page.coverage.
-    if (COV_ENABLED && page.coverage) {
-      await page.coverage.startJSCoverage({
-        resetOnNavigation: false,
-        reportAnonymousScripts: false,
-      });
-      await page.coverage.startCSSCoverage({ resetOnNavigation: false });
-    }
+  const controller = new PerfController(page, client, undefined, memGc);
 
-    const controller = new PerfController(page, client);
-    await use(controller);
-
-    // Drain pending PerformanceObserver records first (callbacks are async, so a
-    // long task at the end of the last span would otherwise be missed).
+  const finish = async (title: string) => {
+    // Drain pending PerformanceObserver records first (callbacks are async).
     await page
       .evaluate(() => (window as unknown as PerfWindow).__perf?.flush?.())
       .catch(() => {});
@@ -2134,60 +2288,12 @@ export const test = base.extend<{ perf: PerfController }>({
     const timeOrigin = await page
       .evaluate(() => performance.timeOrigin)
       .catch(() => 0);
-    // Detect software GL (SwiftShader): its GPU/render numbers are not real hardware.
-    const glRenderer = await page
-      .evaluate(() => {
-        try {
-          const gl = document.createElement("canvas").getContext("webgl");
-          if (!gl) return null;
-          const ext = gl.getExtension("WEBGL_debug_renderer_info");
-          return ext
-            ? (gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) as string)
-            : (gl.getParameter(gl.RENDERER) as string);
-        } catch {
-          return null;
-        }
-      })
-      .catch(() => null);
-    // CSS/DOM capacity: the structural reason a style recalc is expensive
-    // (elements × selectors). Cross-origin sheets throw on cssRules and are skipped.
-    const css = await page
-      .evaluate(() => {
-        let cssRules = 0;
-        let selectors = 0;
-        let styleSheets = 0;
-        const walk = (rules: CSSRuleList) => {
-          for (const rule of Array.from(rules)) {
-            const sel = (rule as CSSStyleRule).selectorText;
-            if (sel) {
-              cssRules += 1;
-              selectors += sel.split(",").length;
-            }
-            const nested = (rule as CSSGroupingRule).cssRules;
-            if (nested) walk(nested);
-          }
-        };
-        for (const sheet of Array.from(document.styleSheets)) {
-          styleSheets += 1;
-          try {
-            walk(sheet.cssRules);
-          } catch {
-            /* cross-origin stylesheet — rules not readable */
-          }
-        }
-        return {
-          styleSheets,
-          cssRules,
-          selectors,
-          domNodes: document.getElementsByTagName("*").length,
-        };
-      })
-      .catch(() => undefined);
+    const glRenderer = await page.evaluate(readGlRenderer).catch(() => null);
+    const css = await page.evaluate(readCssProfile).catch(() => undefined);
 
-    // Stop coverage while the page is still open; build the report + range artifact.
     let coverage: Coverage | undefined;
     let covArtifact: CoverageArtifact | undefined;
-    if (COV_ENABLED && page.coverage) {
+    if (opts.coverage && page.coverage) {
       const jsCov = await page.coverage.stopJSCoverage().catch(() => []);
       const cssCov = await page.coverage.stopCSSCoverage().catch(() => []);
       const built = buildCoverage(
@@ -2198,135 +2304,28 @@ export const test = base.extend<{ perf: PerfController }>({
       covArtifact = built.artifact;
     }
 
-    // Image over-fetch + uncompressed resources, from Resource Timing + the DOM.
-    const media = await page
-      .evaluate(() => {
-        const res = performance.getEntriesByType(
-          "resource",
-        ) as PerformanceResourceTiming[];
-        const byUrl = new Map(res.map((r) => [r.name, r]));
-        const dpr = window.devicePixelRatio || 1;
-        let imageCount = 0;
-        let imageBytes = 0;
-        const oversized: Array<{
-          url: string;
-          naturalPx: string;
-          renderedPx: string;
-          overFetch: number;
-          kb: number;
-        }> = [];
-        for (const img of Array.from(document.images)) {
-          const url = img.currentSrc || img.src;
-          const nW = img.naturalWidth;
-          const nH = img.naturalHeight;
-          if (!url || !nW || !nH) continue;
-          imageCount += 1;
-          const r = byUrl.get(url);
-          const bytes = r ? r.encodedBodySize || r.transferSize || 0 : 0;
-          imageBytes += bytes;
-          const rect = img.getBoundingClientRect();
-          const rW = Math.round(rect.width);
-          const rH = Math.round(rect.height);
-          if (rW > 0 && rH > 0) {
-            const overFetch = (nW * nH) / (rW * rH * dpr * dpr);
-            if (overFetch >= 4) {
-              oversized.push({
-                url,
-                naturalPx: `${nW}x${nH}`,
-                renderedPx: `${rW}x${rH}`,
-                overFetch: Math.round(overFetch * 10) / 10,
-                kb: Math.round(bytes / 102.4) / 10,
-              });
-            }
-          }
-        }
-        oversized.sort((a, b) => b.kb - a.kb);
-        const textType = new Set([
-          "script",
-          "link",
-          "css",
-          "fetch",
-          "xmlhttprequest",
-          "other",
-        ]);
-        const uncompressed: Array<{
-          url: string;
-          kb: number;
-          ratio: number;
-          type: string;
-        }> = [];
-        for (const r of res) {
-          if (!textType.has(r.initiatorType)) continue;
-          const enc = r.encodedBodySize;
-          const dec = r.decodedBodySize;
-          if (!enc || !dec || enc < 20_000) continue; // skip tiny / cross-origin (no TAO)
-          const ratio = dec / enc;
-          if (ratio < 1.1) {
-            uncompressed.push({
-              url: r.name,
-              kb: Math.round(enc / 102.4) / 10,
-              ratio: Math.round(ratio * 100) / 100,
-              type: r.initiatorType,
-            });
-          }
-        }
-        uncompressed.sort((a, b) => b.kb - a.kb);
-        return {
-          imageCount,
-          imageKB: Math.round(imageBytes / 102.4) / 10,
-          oversized: oversized.slice(0, 10),
-          uncompressed: uncompressed.slice(0, 10),
-        };
-      })
-      .catch(() => undefined);
-
-    // Render-blocking resources in <head>: stylesheets + parser-blocking scripts.
+    const media = await page.evaluate(readMedia).catch(() => undefined);
     const renderBlocking = await page
-      .evaluate(() => {
-        const stylesheets: string[] = [];
-        const scripts: string[] = [];
-        const head = document.head;
-        if (head) {
-          for (const link of Array.from(
-            head.querySelectorAll<HTMLLinkElement>("link[rel~=stylesheet]"),
-          )) {
-            if (link.hasAttribute("disabled")) continue;
-            const media = (link.getAttribute("media") || "all").toLowerCase();
-            // only media that applies to the screen blocks the initial render
-            if (media === "all" || media === "screen" || media === "")
-              stylesheets.push(link.getAttribute("href") || "");
-          }
-          for (const s of Array.from(
-            head.querySelectorAll<HTMLScriptElement>("script[src]"),
-          )) {
-            // async/defer and type=module (deferred by default) don't block parsing
-            if (
-              !s.hasAttribute("async") &&
-              !s.hasAttribute("defer") &&
-              (s.getAttribute("type") || "") !== "module"
-            )
-              scripts.push(s.getAttribute("src") || "");
-          }
-        }
-        return { stylesheets, scripts };
-      })
+      .evaluate(readRenderBlocking)
       .catch(() => undefined);
 
     const url = page.url();
     const reqs = finishNetwork();
-    // finish the trace before buildReport so Paint/GPU can correlate to spans.
-    // The full trace is already streamed to tracePath; this returns only the
-    // small Paint/GPUTask subset aggregation needs.
     const renderEvents = finishTrace
       ? (await finishTrace()).renderEvents
       : undefined;
 
-    fs.mkdirSync(PERF_OUT_DIR, { recursive: true });
-
     const report = buildReport(
-      testInfo,
+      title,
       url,
-      raw ?? { vitals: {}, longTasks: [], loaf: [], measures: [], events: [], frames: [] },
+      raw ?? {
+        vitals: {},
+        longTasks: [],
+        loaf: [],
+        measures: [],
+        events: [],
+        frames: [],
+      },
       timeOrigin,
       controller.spans,
       reqs,
@@ -2334,47 +2333,29 @@ export const test = base.extend<{ perf: PerfController }>({
     );
 
     if (css) report.css = css;
-    if (renderBlocking && (renderBlocking.stylesheets.length || renderBlocking.scripts.length))
+    if (
+      renderBlocking &&
+      (renderBlocking.stylesheets.length || renderBlocking.scripts.length)
+    )
       report.renderBlocking = renderBlocking;
-    if (media && (media.oversized.length || media.uncompressed.length || media.imageCount))
+    if (
+      media &&
+      (media.oversized.length || media.uncompressed.length || media.imageCount)
+    )
       report.media = media;
     if (coverage) report.coverage = coverage;
     if (glRenderer) report.glRenderer = glRenderer;
     if (pageErrors.length) report.pageErrors = pageErrors;
     if (Object.keys(controller.vitalsBudget).length > 0)
       report.vitalsBudget = controller.vitalsBudget;
-    // raw === undefined means the addInitScript collector never ran in the page.
     if (raw === undefined) report.collectorMissing = true;
+    if (opts.trace && opts.tracePath) report.tracePath = opts.tracePath;
 
-    // the trace file was streamed to disk during the run (see startTrace)
-    if (TRACE_ENABLED) report.tracePath = tracePath;
+    return { report, covArtifact };
+  };
 
-    const jsonPath = path.join(PERF_OUT_DIR, `${slug}.${runTag}.json`);
-    fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2));
-    // Range artifact for cross-scenario union (scripts/coverage.mjs).
-    if (covArtifact) {
-      fs.writeFileSync(
-        path.join(PERF_OUT_DIR, `${slug}.${runTag}.coverage.json`),
-        JSON.stringify(covArtifact),
-      );
-    }
-    await testInfo.attach("perf-report", {
-      path: jsonPath,
-      contentType: "application/json",
-    });
+  return { controller, pageErrors, finish };
+}
 
-    logSummary(report);
-
-    // Inline budget assertion (opt-in). Off by default because a single run is
-    // noisy for duration/blocking; the statistically sound gate is the median
-    // script. Enable PERF_ASSERT=1 for fast local fail-fast on stable metrics.
-    if (process.env.PERF_ASSERT === "1") {
-      const violations = checkBudgets(report);
-      if (violations.length > 0) {
-        throw new Error(`perf budget exceeded:\n  ${violations.join("\n  ")}`);
-      }
-    }
-  },
-});
-
-export { expect } from "@playwright/test";
+// The Playwright fixture (`test` / `expect`) lives in src/fixture.ts so this core
+// module stays free of an @playwright/test runtime import (see the import note).

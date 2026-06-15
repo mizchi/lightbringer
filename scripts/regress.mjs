@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 /**
  * Baseline-relative regression gate. Compares a baseline set of median reports
  * (<slug>.median.json) against the current set and fails when a metric got worse
