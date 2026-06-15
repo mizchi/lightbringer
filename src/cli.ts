@@ -9,6 +9,8 @@
 // file from the measured medians and --gate fails against it (no hand-set numbers).
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { chromium, type Page, type BrowserContextOptions } from "playwright";
 import { startSession, logSummary, type PerfReport, type SpanReport } from "./collector";
 
@@ -37,7 +39,9 @@ type SettleSpec = "networkidle" | "load" | "raf" | number;
 const argv = process.argv.slice(2);
 if (argv[0] !== "run" || !argv[1]) {
   console.error(
-    "usage: lightbringer run <scenario.json> [--repeat N] [--out DIR]\n" +
+    "usage: lightbringer run <scenario.json | existing-spec.ts> [--repeat N] [--out DIR]\n" +
+      "       (a .json runs a declarative scenario; anything else runs an existing\n" +
+      "        Playwright spec via `playwright test` + the repo's own config)\n" +
       "       [--gpu] [--cpu N] [--net slow-3g|fast-3g|4g] [--cov] [--mem] [--css]\n" +
       "       [--trace] [--headed] [--emit-budgets] [--gate]",
   );
@@ -72,9 +76,19 @@ const NET_PROFILES: Record<string, { latency: number; downloadThroughput: number
 };
 const netProfile = netName ? NET_PROFILES[netName] ?? null : null;
 
+// A .json argument is a declarative scenario; anything else (a .ts/.js test file
+// or glob) is an existing Playwright spec, run via `playwright test` with the auto
+// loader and the repo's own config.
+const isSpec = !scenarioPath.endsWith(".json");
+
 // ── scenario ────────────────────────────────────────────────────────────────
-const scenario: Scenario = JSON.parse(fs.readFileSync(scenarioPath, "utf8"));
-const slug = path.basename(scenarioPath).replace(/\.json$/, "").replace(/[^\p{L}\p{N}_]+/gu, "_");
+const scenario: Scenario = isSpec
+  ? { url: "", steps: [] }
+  : JSON.parse(fs.readFileSync(scenarioPath, "utf8"));
+const slug = path
+  .basename(scenarioPath)
+  .replace(/\.(json|[tj]s)$/, "")
+  .replace(/[^\p{L}\p{N}_]+/gu, "_");
 
 function settleFn(spec: SettleSpec | undefined) {
   const s = spec ?? scenario.settle ?? "networkidle";
@@ -173,39 +187,51 @@ function medians(runs: PerfReport[]): Record<string, Record<string, number>> {
   return out;
 }
 
-async function main() {
-  const runs: PerfReport[] = [];
-  for (let i = 0; i < repeat; i++) {
-    process.stderr.write(`[lightbringer] run ${i + 1}/${repeat}\n`);
-    runs.push(await runOnce(i));
-  }
-  logSummary(runs[runs.length - 1]!, mem);
+type SlugBudgets = Record<string, Record<string, Record<string, number>>>;
 
+/** Read the per-run report files written by the run (scenario or spec). */
+function loadRunsBySlug(): Map<string, PerfReport[]> {
+  const m = new Map<string, PerfReport[]>();
+  if (!fs.existsSync(outDir)) return m;
+  for (const f of fs.readdirSync(outDir)) {
+    if (!/\.run\d+\.json$/.test(f) || f.includes(".coverage.") || f.includes(".trace.")) continue;
+    const s = f.replace(/\.run\d+\.json$/, "");
+    const r = JSON.parse(fs.readFileSync(path.join(outDir, f), "utf8")) as PerfReport;
+    (m.get(s) ?? m.set(s, []).get(s)!).push(r);
+  }
+  return m;
+}
+
+/** Emit budgets from medians (×1.25) and/or gate against them. Keyed slug→span→metric. */
+function emitOrGate(bySlug: Map<string, PerfReport[]>) {
   const budgetsPath = path.join(outDir, "lightbringer.budgets.json");
   if (emitBudgets) {
-    // budget = median × 1.25 headroom, rounded — derived, not hand-set.
-    const med = medians(runs);
-    const budgets: Record<string, Record<string, number>> = {};
-    for (const [span, metrics] of Object.entries(med)) {
-      budgets[span] = {};
-      for (const [k, v] of Object.entries(metrics)) budgets[span]![k] = Math.ceil(v * 1.25);
+    const budgets: SlugBudgets = {};
+    for (const [s, runs] of bySlug) {
+      budgets[s] = {};
+      for (const [span, metrics] of Object.entries(medians(runs))) {
+        budgets[s]![span] = {};
+        for (const [k, v] of Object.entries(metrics)) budgets[s]![span]![k] = Math.ceil(v * 1.25);
+      }
     }
     fs.writeFileSync(budgetsPath, JSON.stringify(budgets, null, 2));
     console.log(`\n[lightbringer] wrote budgets → ${path.relative(process.cwd(), budgetsPath)} (median ×1.25)`);
   }
-
   if (gate) {
     if (!fs.existsSync(budgetsPath)) {
       console.error(`[lightbringer] --gate: no budgets at ${budgetsPath} (run --emit-budgets first)`);
       process.exit(1);
     }
-    const budgets = JSON.parse(fs.readFileSync(budgetsPath, "utf8")) as Record<string, Record<string, number>>;
-    const med = medians(runs);
+    const budgets = JSON.parse(fs.readFileSync(budgetsPath, "utf8")) as SlugBudgets;
     const violations: string[] = [];
-    for (const [span, metrics] of Object.entries(budgets)) {
-      for (const [k, limit] of Object.entries(metrics)) {
-        const actual = med[span]?.[k];
-        if (actual != null && actual > limit) violations.push(`${span}.${k} median=${actual} > budget ${limit}`);
+    for (const [s, runs] of bySlug) {
+      const med = medians(runs);
+      for (const [span, metrics] of Object.entries(budgets[s] ?? {})) {
+        for (const [k, limit] of Object.entries(metrics)) {
+          const actual = med[span]?.[k];
+          if (actual != null && actual > limit)
+            violations.push(`${s} / ${span}.${k} median=${actual} > budget ${limit}`);
+        }
       }
     }
     if (violations.length) {
@@ -213,8 +239,48 @@ async function main() {
       for (const v of violations) console.error(`  ✗ ${v}`);
       process.exit(1);
     }
-    console.log(`\n[lightbringer] gate passed (${Object.keys(budgets).length} spans).`);
+    console.log(`\n[lightbringer] gate passed.`);
   }
+}
+
+/** Spec mode: run an existing Playwright spec with the auto loader + the repo's config. */
+function runSpecMode() {
+  const hookPath = fileURLToPath(new URL("../scripts/pw-hook.mjs", import.meta.url));
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    LIGHTBRINGER_AUTO_WRAP: new URL("./auto.js", import.meta.url).href,
+    PERF_OUT_DIR: outDir,
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import ${hookPath}`.trim(),
+  };
+  if (cpuRate > 1) env.PERF_CPU = String(cpuRate);
+  if (mem) env.PERF_MEM = "1";
+  if (cov) env.PERF_COV = "1";
+  if (css) env.PERF_CSS = "1";
+  if (trace) env.PERF_TRACE = "1";
+  if (gpu) env.PERF_GPU = "1";
+  if (netName) env.PERF_NET = netName;
+  const args = ["playwright", "test", scenarioPath];
+  const cfg = opt("config");
+  if (cfg) args.push("--config", cfg);
+  if (repeat > 1) args.push(`--repeat-each=${repeat}`);
+  process.stderr.write(`[lightbringer] npx ${args.join(" ")}\n`);
+  const res = spawnSync("npx", args, { stdio: "inherit", env });
+  if (res.status) process.exit(res.status);
+}
+
+async function main() {
+  if (isSpec) {
+    runSpecMode(); // auto fixture logs each test + writes perf-results/*.json
+    if (emitBudgets || gate) emitOrGate(loadRunsBySlug());
+    return;
+  }
+  const runs: PerfReport[] = [];
+  for (let i = 0; i < repeat; i++) {
+    process.stderr.write(`[lightbringer] run ${i + 1}/${repeat}\n`);
+    runs.push(await runOnce(i));
+  }
+  logSummary(runs[runs.length - 1]!, mem);
+  if (emitBudgets || gate) emitOrGate(new Map([[slug, runs]]));
 }
 
 main().catch((e) => {

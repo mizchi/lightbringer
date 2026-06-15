@@ -138,6 +138,25 @@ The CLI bundles Playwright; the browser binary is the only prerequisite
 (`npx playwright install chromium`). For CI integration or app-code spans, use the
 test fixture below instead.
 
+### Run an existing Playwright spec (reuse your specs + config)
+
+Already have `e2e/*.spec.ts` and a `playwright.config.ts`? Point `run` at a spec
+(anything that isn't `.json`) and lightbringer runs it through `playwright test`
+with **your existing config** (webServer / baseURL / projects) — measuring every
+navigation and interaction, **without editing the spec**:
+
+```sh
+pnpm dlx lightbringer run e2e/checkout.spec.ts
+pnpm dlx lightbringer run e2e/ --config playwright.config.ts --repeat 5 --emit-budgets
+```
+
+It works by injecting a Node loader that swaps the spec's `@playwright/test` `test`
+for the auto-instrumented one (the same as `lightbringer/auto`), so each
+`page.goto` / `getByRole(...).click()` becomes a span. `--config`, `--repeat`
+(→ `--repeat-each`) and the PERF flags (`--cpu/--mem/--cov/--css/--trace/--net`)
+are forwarded; `--emit-budgets` / `--gate` work per spec file. Same caveat as
+auto-span: a span is one action's own cost, not "until the next assertion".
+
 ## Install (test fixture)
 
 ```sh

@@ -13,7 +13,7 @@
 // use the explicit `test` from "lightbringer" and perf.measure().
 import fs from "node:fs";
 import path from "node:path";
-import { test as base } from "@playwright/test";
+import { test as base, type Page, type TestInfo } from "@playwright/test";
 import {
   startSession,
   logSummary,
@@ -54,8 +54,14 @@ function locatorLabel(loc: unknown): string {
   return s.replace(/^[A-Za-z]+\(['"]?/, "").replace(/['"]?\)$/, "").slice(0, 50);
 }
 
-export const test = base.extend<{ perf: PerfController }>({
-  page: async ({ page }, use, testInfo) => {
+// The page-fixture override that auto-measures every action. Shared by the
+// `lightbringer/auto` test below and autoWrap() (used by the CLI's loader to wrap
+// an existing repo's @playwright/test without editing specs).
+const autoPageFixture = async (
+  { page }: { page: Page },
+  use: (p: Page) => Promise<void>,
+  testInfo: TestInfo,
+) => {
     const slug = testInfo.titlePath
       .filter(Boolean)
       .join("_")
@@ -152,7 +158,19 @@ export const test = base.extend<{ perf: PerfController }>({
         throw new Error(`perf budget exceeded:\n  ${violations.join("\n  ")}`);
       }
     }
-  },
+};
+
+export const test = base.extend<{ perf: PerfController }>({
+  page: autoPageFixture,
 });
+
+/**
+ * Wrap an existing test object with the auto-span page fixture. The CLI's loader
+ * uses this to instrument a repo's own `@playwright/test` test (and any fixtures
+ * merged onto it) without the spec importing lightbringer at all.
+ */
+export function autoWrap(t: typeof base): typeof base {
+  return t.extend({ page: autoPageFixture });
+}
 
 export { expect } from "@playwright/test";
