@@ -503,6 +503,40 @@ The bench specs here default to their *slow* path (to demonstrate each metric), 
 the template passes `BENCH_FIXED=1` to run the optimized path and stay green —
 your own specs won't need that.
 
+## `lightbringer/analyze` (framework-agnostic analysis)
+
+The part that turns raw CDP / Performance events into a report is a pure layer
+with no Playwright, network, or filesystem dependency. It's published as a
+separate subpath so you can reuse the analysis against events you captured some
+other way (puppeteer, `chrome-remote-interface`, a saved trace):
+
+```ts
+import {
+  buildSpanNetwork, // CDP Network records → per-span waterfall / 3p / initiators
+  buildGlobalNetwork,
+  diffMetrics, // Performance.getMetrics delta → style/layout/script/nodes
+  buildTraceRender, // trace Paint/GPUTask → paint count / gpu ms
+  buildSpanCpu, // long task / LoAF → blocking ms
+  diffMemory,
+  buildTrends, // repeated-step memory series → leak verdict
+  buildCoverage, // V8/CSS coverage entries → used % per chunk (innermost-range)
+  buildSpanInteraction, // Event Timing → per-step INP (input / processing / present)
+  buildSpanFrames, // rAF timestamps → dropped frames / fps
+  registrableDomain,
+  isThirdParty,
+} from "lightbringer/analyze";
+
+// e.g. classify a captured request, or score a series you collected yourself
+isThirdParty("https://cdn.other.com/a.js", "example.com"); // true
+buildTrends(spans).find((t) => t.metric === "jsHeapUsedMB")?.leak;
+```
+
+Every function is a deterministic input→output transform (the per-domain report
+fragment types — `SpanNetwork`, `SpanCpu`, `SpanRender`, `SpanMemory`,
+`SpanInteraction`, `SpanFrames`, `Coverage`, `MemoryTrend` — live here too), unit
+tested in isolation. `lightbringer`'s own collector is just the capture +
+report-assembly driver on top of this layer.
+
 ## Accuracy
 
 Measured against a known busy-loop in a page-owned click handler (see
