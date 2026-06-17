@@ -7,25 +7,29 @@ export type {
   VitalsBudget,
   PerfReport,
   SpanReport,
+  AppSpanReport,
+  CssProfile,
+  MediaReport,
+  RenderBlocking,
+  SessionOptions,
+  PerfSession,
+} from "./collector";
+// Per-domain report fragment types come from the analyze layer (also importable
+// directly as `lightbringer/analyze` alongside the pure builder functions).
+export type {
   SpanNetwork,
   SpanCpu,
   SpanRender,
   SpanMemory,
   SpanInteraction,
   SpanFrames,
-  AppSpanReport,
   NetworkReport,
   VitalSample,
-  CssProfile,
-  MediaReport,
-  RenderBlocking,
   Coverage,
   CoverageReport,
   MemoryTrend,
   Initiator,
-  SessionOptions,
-  PerfSession,
-} from "./collector";
+} from "./analyze";
 export { startSpan, withSpan } from "./trace";
 export type { Span } from "./trace";
 export { toOtelSpans } from "./otel";

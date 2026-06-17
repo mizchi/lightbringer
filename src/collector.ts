@@ -6,6 +6,53 @@ import { createRequire } from "node:module";
 // (src/fixture.ts) is what actually imports @playwright/test's test runner.
 import type { CDPSession, Page } from "playwright";
 import { toOtelSpans, type OtelSpan } from "./otel";
+// The CDP/Performance-event analysis is the framework-agnostic `analyze` layer
+// (pure functions, separately unit-tested). collector.ts is the capture + report
+// assembly that drives a Playwright Page/CDPSession and feeds those analyzers.
+import { round, type EpochWindow } from "./analyze/util";
+import {
+  hostOf,
+  registrableDomain,
+  shortenUrl,
+  summarizeInitiator,
+  buildGlobalNetwork,
+  buildSpanNetwork,
+  type NetReq,
+  type CdpInitiator,
+  type SpanNetwork,
+  type NetworkReport,
+} from "./analyze/network";
+import {
+  diffMetrics,
+  buildTraceRender,
+  buildSpanCpu,
+  type SpanRender,
+  type SpanCpu,
+  type TraceEvent,
+} from "./analyze/render";
+import {
+  diffMemory,
+  buildTrends,
+  type SpanMemory,
+  type MemoryTrend,
+} from "./analyze/memory";
+import {
+  buildCoverage,
+  type Coverage,
+  type CoverageReport,
+  type CoverageArtifact,
+  type JSCoverageEntry,
+  type CSSCoverageEntry,
+} from "./analyze/coverage";
+import {
+  pickAttribution,
+  buildSpanInteraction,
+  buildSpanFrames,
+  type VitalSample,
+  type SpanInteraction,
+  type SpanFrames,
+  type EpochEvent,
+} from "./analyze/vitals";
 
 // ---------------------------------------------------------------------------
 // Per-step performance collector for Playwright.
@@ -90,185 +137,10 @@ const NET_PROFILES: Record<
 export const NET_PROFILE = NET_PROFILES[process.env.PERF_NET ?? ""];
 
 // ---------------------------------------------------------------------------
-// Report types (the contract layer)
+// Report types (the contract layer). The per-domain fragment types
+// (SpanNetwork / SpanCpu / SpanRender / SpanMemory / ...) live in ./analyze;
+// the composite report types that tie them together live here.
 // ---------------------------------------------------------------------------
-
-export interface VitalSample {
-  value: number;
-  rating: string;
-  attribution: Record<string, unknown>;
-}
-
-/**
- * Cost a span incurs from third-party origins (analytics, tag managers, ad
- * tech, embedded widgets) — anything served from a registrable domain other
- * than the page's own. This is the "weight emitted by non-application scripts":
- * bytes the app didn't ship and network time it didn't ask for. CPU spent by
- * third-party scripts is attributed separately by the drilldown (PERF_TRACE),
- * which classifies CPU-profiler frames by their script URL host.
- */
-export interface ThirdPartyBreakdown {
-  requestCount: number;
-  encodedKB: number;
-  /** wall time third-party requests kept the network busy (union of intervals, ms) */
-  busyMs: number;
-  /** per registrable-domain breakdown, heaviest first (by bytes) */
-  byDomain: Array<{
-    domain: string;
-    requestCount: number;
-    encodedKB: number;
-    busyMs: number;
-  }>;
-}
-
-/**
- * What triggered a request (CDP `Network.requestWillBeSent.initiator`). The
- * network-side analogue of the CPU drilldown: when a span's waterfall is deep,
- * this points at the code (or the parser) that issued the requests.
- */
-export interface Initiator {
-  /** script | parser | preload | preflight | other */
-  type: string;
-  /** best-effort triggering site: "functionName  url:line" (script) or "url:line" (parser) */
-  frame?: string;
-}
-
-/** Requests grouped by what issued them (heaviest first, by request count). */
-export interface InitiatorStat {
-  frame: string;
-  type: string;
-  requestCount: number;
-  encodedKB: number;
-}
-
-/** Network breakdown of a span (network bottleneck analysis). */
-export interface SpanNetwork {
-  requestCount: number;
-  encodedKB: number;
-  /** Wall time the network was busy during the span (union of request intervals, ms). */
-  busyMs: number;
-  /** Waterfall waves = approximate depth of serial dependency. 1 = one parallel wave. */
-  waves: number;
-  /** subset of this span's network attributable to third-party origins */
-  thirdParty: ThirdPartyBreakdown;
-  /** requests grouped by what issued them (top issuers first); over ALL requests */
-  byInitiator: InitiatorStat[];
-  requests: Array<{
-    url: string;
-    type: string;
-    /** start offset relative to the span start (ms) */
-    startOffsetMs: number;
-    durationMs: number;
-    kb: number;
-    /** true if served from a registrable domain other than the page's */
-    thirdParty: boolean;
-    /** what triggered the request (code / parser), best-effort */
-    initiator?: Initiator;
-  }>;
-}
-
-/**
- * Responsiveness of the interactions inside a span (per-step INP). web-vitals
- * reports one page-global worst INP; this attributes the worst interaction to the
- * span it happened in and breaks it into the three INP phases, so you can see
- * which step is janky and why. Sourced from the Event Timing API
- * (interactionId > 0 entries). Undefined for spans with no interaction.
- */
-export interface SpanInteraction {
-  /** interactions (interactionId>0 event-timing entries) in the span */
-  count: number;
-  /** worst interaction's total latency (input → next paint), ms — the span's INP */
-  maxDurationMs: number;
-  /** event type of the worst interaction (click / keydown / pointerup / …) */
-  type: string;
-  /** time before the handler ran (main thread busy) */
-  inputDelayMs: number;
-  /** time spent in the event handlers */
-  processingMs: number;
-  /** time from handlers done to the next paint */
-  presentationMs: number;
-}
-
-/**
- * Frame cadence during a span (animation smoothness), from a rAF probe. A static
- * span sits near display refresh with no drops; a janky pan/scroll shows dropped
- * frames and a long worst-frame. The量-side render metrics (paint/gpu) say how
- * much work; this says whether it actually rendered smoothly.
- */
-export interface SpanFrames {
-  count: number;
-  /** missed display frames (each gap counts floor(gap/16.7)-1) */
-  droppedFrames: number;
-  /** longest gap between frames (ms) — the worst hitch */
-  longestFrameMs: number;
-  /** effective frames per second over the span */
-  fps: number;
-}
-
-/** CPU breakdown of a span (CPU bottleneck analysis). */
-export interface SpanCpu {
-  longTaskCount: number;
-  /** total long task time (ms), approx. main-thread blocking */
-  blockingMs: number;
-  maxLongTaskMs: number;
-  loafCount: number;
-  /** blockingDuration of the heaviest LoAF (ms) */
-  maxLoafBlockingMs: number;
-}
-
-/**
- * Render breakdown of a span (DOM change -> style recalc -> layout -> paint).
- * style/layout/script come from CDP Performance.getMetrics cumulative counters.
- * paint/GPU are filled from the trace when PERF_TRACE=1 (undefined otherwise).
- */
-export interface SpanRender {
-  recalcStyleCount: number;
-  recalcStyleMs: number;
-  layoutCount: number;
-  layoutMs: number;
-  /** net DOM nodes added during the span (CDP Nodes delta) — the driver of huge-DOM
-   * style/layout cost. Not a memory metric; a render-cost cause. */
-  nodes: number;
-  /** JS execution time in the span (ms, CDP metric; distinct from cpu.blockingMs) */
-  scriptMs: number;
-  paintCount?: number;
-  paintMs?: number;
-  gpuMs?: number;
-}
-
-/**
- * Memory load a span incurs, from CDP Performance.getMetrics gauges (always on,
- * no trace needed). This is per-step memory *load* — how much a step grows the JS
- * heap and what it retains (DOM / listeners / documents) — in the same
- * "resource consumed per step" model as cpu / network / render. It is NOT
- * heap-snapshot leak detection: the retained-object graph (which object holds
- * what) is out of scope. The leak *signal* here is a delta that stays positive
- * across repeated runs of the same step (heap / listeners / documents climbing).
- *
- * Byte-level binary / GPU memory is NOT available here: CDP getMetrics has no
- * byte counter for off-heap memory (only disabled-by-default-memory-infra trace
- * dumps do, which are heavy and unreliable headless), and JSHeapUsedSize counts
- * only on-heap JS objects — an ArrayBuffer / typed-array / wasm backing store is
- * off-heap and does NOT move it. The closest available proxy for buffer memory is
- * arrayBuffers, a *count* of live ArrayBuffers (climbing ⇒ buffers being retained,
- * e.g. GPU textures / staging buffers / wasm), not their byte size.
- */
-export interface SpanMemory {
-  /** on-heap JS in use at span end (MB, absolute; excludes off-heap buffer backing stores) */
-  jsHeapUsedMB: number;
-  /** on-heap JS growth during the span (MB; sustained positive across repeats ⇒ leak) */
-  jsHeapDeltaMB: number;
-  /** count of live ArrayBuffers at span end (NOT bytes; a climbing count ⇒ buffer leak) */
-  arrayBuffers: number;
-  /** total DOM nodes retained at span end (absolute; the DOM size, not the delta) */
-  domNodes: number;
-  /** event listeners retained at span end (absolute; climbing every step ⇒ listener leak) */
-  jsEventListeners: number;
-  /** net event listeners added during the span */
-  listenersDelta: number;
-  /** net documents added during the span (climbing ⇒ detached-document leak) */
-  documentsDelta: number;
-}
 
 /**
  * Per-span budget. Each field is an upper bound; the median gate (and optional
@@ -394,19 +266,6 @@ export interface AppSpanReport extends OtelSpan {
   cpu: SpanCpu;
 }
 
-export interface NetworkReport {
-  totalRequests: number;
-  totalEncodedKB: number;
-  byType: Record<string, { count: number; encodedKB: number }>;
-  slowest: Array<{ url: string; type: string; durationMs: number; kb: number }>;
-  /** scenario-wide third-party total (bytes/requests the app didn't ship) */
-  thirdParty: ThirdPartyBreakdown;
-  /** scenario-wide request issuers (which code / parser issued the most requests) */
-  byInitiator: InitiatorStat[];
-  /** requests served from cache (disk / memory / prefetch / SW) — no network fetch */
-  fromCacheCount: number;
-}
-
 /** Upper bounds on page-global web-vitals (gated on the median, like span budgets). */
 export interface VitalsBudget {
   LCP?: number;
@@ -414,32 +273,6 @@ export interface VitalsBudget {
   CLS?: number;
   TTFB?: number;
   FCP?: number;
-}
-
-/**
- * Growth of a memory metric across repeated runs of the SAME step (the `#0..#N`
- * spans emitted by measureRepeat). Per-step deltas are GC-noisy, but a value that
- * climbs monotonically every time you repeat the same operation is the real leak
- * signal — and it stays inside one scenario, so it isn't the out-of-scope
- * cross-scenario analysis. Most trustworthy under PERF_MEM=1 (retained-only).
- */
-export interface MemoryTrend {
-  /** the repeated step name (the shared prefix of the `#i` spans) */
-  name: string;
-  /** number of repeats */
-  count: number;
-  /** which memory gauge: jsHeapUsedMB | jsEventListeners | domNodes | arrayBuffers */
-  metric: string;
-  /** the metric's absolute value at the end of each repeat */
-  values: number[];
-  /** last - first */
-  growth: number;
-  /** growth per repeat */
-  perStep: number;
-  /** value never (meaningfully) dropped across the repeats */
-  monotonic: boolean;
-  /** monotonic AND grew past the metric's floor — flagged as a likely leak */
-  leak: boolean;
 }
 
 export interface PerfReport {
@@ -486,29 +319,6 @@ export interface CssProfile {
   selectors: number;
   /** live DOM element count */
   domNodes: number;
-}
-
-/** Coverage of one downloaded resource (a JS chunk or a stylesheet). */
-export interface CoverageFile {
-  url: string;
-  totalBytes: number;
-  usedBytes: number;
-  /** usedBytes / totalBytes as a percentage (0..100) */
-  usedPct: number;
-}
-
-/** JS or CSS coverage rollup for the scenario. */
-export interface CoverageReport {
-  totalBytes: number;
-  usedBytes: number;
-  usedPct: number;
-  /** per-resource, heaviest unused first (the best split / drop candidates) */
-  files: CoverageFile[];
-}
-
-export interface Coverage {
-  js: CoverageReport;
-  css: CoverageReport;
 }
 
 /**
@@ -750,42 +560,6 @@ interface RawSpan {
   budget?: Budget;
 }
 
-/** CDP Performance.getMetrics cumulative counter delta -> render cost */
-function diffMetrics(
-  before: Record<string, number>,
-  after: Record<string, number>,
-): SpanRender {
-  const d = (k: string) => (after[k] ?? 0) - (before[k] ?? 0);
-  return {
-    recalcStyleCount: d("RecalcStyleCount"),
-    recalcStyleMs: round(d("RecalcStyleDuration") * 1000),
-    layoutCount: d("LayoutCount"),
-    layoutMs: round(d("LayoutDuration") * 1000),
-    nodes: d("Nodes"),
-    scriptMs: round(d("ScriptDuration") * 1000),
-  };
-}
-
-const BYTES_PER_MB = 1024 * 1024;
-
-/** CDP Performance.getMetrics memory gauges -> per-step memory load. */
-function diffMemory(
-  before: Record<string, number>,
-  after: Record<string, number>,
-): SpanMemory {
-  const d = (k: string) => (after[k] ?? 0) - (before[k] ?? 0);
-  const a = (k: string) => after[k] ?? 0;
-  return {
-    jsHeapUsedMB: round(a("JSHeapUsedSize") / BYTES_PER_MB),
-    jsHeapDeltaMB: round(d("JSHeapUsedSize") / BYTES_PER_MB),
-    arrayBuffers: a("ArrayBufferContents"),
-    domNodes: a("Nodes"),
-    jsEventListeners: a("JSEventListeners"),
-    listenersDelta: d("JSEventListeners"),
-    documentsDelta: d("Documents"),
-  };
-}
-
 export class PerfController {
   readonly spans: RawSpan[] = [];
   vitalsBudget: VitalsBudget = {};
@@ -904,62 +678,8 @@ export class PerfController {
 // loadingFinished carries timestamp (monotonic s) only, hence:
 //   startEpochMs = wallTime * 1000
 //   endEpochMs   = startEpochMs + (endMono - startMono) * 1000
+// The NetReq record shape and its summarizer live in ./analyze/network.
 // ---------------------------------------------------------------------------
-
-interface NetReq {
-  url: string;
-  type: string;
-  startMono: number;
-  startEpochMs: number;
-  endEpochMs?: number;
-  encoded?: number;
-  initiator?: Initiator;
-  /** served from disk / memory / prefetch / service-worker cache (no network fetch) */
-  fromCache?: boolean;
-}
-
-/** CDP initiator shape (only the fields we read). */
-interface CdpInitiator {
-  type?: string;
-  url?: string;
-  lineNumber?: number;
-  stack?: {
-    callFrames?: Array<{
-      functionName?: string;
-      url?: string;
-      lineNumber?: number;
-    }>;
-  };
-}
-
-/** Trim the origin off a URL for compact display (mirrors the drilldown). */
-function shortenUrl(url: string): string {
-  if (url.startsWith("data:")) {
-    const comma = url.indexOf(",");
-    return `${url.slice(0, comma > 0 ? Math.min(comma, 40) : 40)}…`;
-  }
-  return url.replace(/^https?:\/\/[^/]+/, "").slice(0, 60) || url.slice(0, 60);
-}
-
-/** Reduce a CDP initiator to a type + a single best-effort triggering frame. */
-function summarizeInitiator(init: CdpInitiator | undefined): Initiator | undefined {
-  if (!init) return undefined;
-  const type = init.type ?? "other";
-  const frames = init.stack?.callFrames ?? [];
-  // the topmost frame with a script URL is the code that issued the request
-  const top = frames.find((f) => f.url) ?? frames[0];
-  if (top) {
-    const fn = top.functionName || "(anonymous)";
-    const loc = top.url ? `${shortenUrl(top.url)}:${(top.lineNumber ?? 0) + 1}` : "";
-    return { type, frame: `${fn}  ${loc}`.trim() };
-  }
-  // parser-inserted (e.g. <img>/<script src>): initiator.url is the referencing doc
-  if (init.url) {
-    const loc = init.lineNumber != null ? `:${init.lineNumber + 1}` : "";
-    return { type, frame: `${shortenUrl(init.url)}${loc}` };
-  }
-  return { type };
-}
 
 async function startNetworkCapture(
   client: CDPSession,
@@ -1097,638 +817,9 @@ async function startTrace(
 }
 
 // ---------------------------------------------------------------------------
-// Aggregation
+// Report assembly. Pulls the per-domain breakdowns from ./analyze and composes
+// them into the SpanReport / PerfReport contract.
 // ---------------------------------------------------------------------------
-
-function round(n: number): number {
-  return Math.round(n * 10) / 10;
-}
-
-/** Max per-request detail entries kept per span (slowest-first); counts/bytes are full. */
-const REQUESTS_PER_SPAN_LIMIT = 20;
-
-// First-party vs third-party classification by registrable domain.
-// Not a full Public Suffix List — a compact set of common multi-label suffixes
-// keeps "third party" honest on typical hosts without bundling the PSL. A
-// request is first-party when its registrable domain equals the page's.
-const MULTI_PART_SUFFIXES = new Set([
-  "co.uk", "gov.uk", "ac.uk", "org.uk", "co.jp", "ne.jp", "or.jp", "go.jp",
-  "ac.jp", "co.kr", "co.in", "co.nz", "co.za", "com.au", "com.br", "com.cn",
-  "com.tw", "com.hk", "com.sg", "com.mx",
-]);
-
-function hostOf(url: string): string | null {
-  try {
-    return new URL(url).hostname.toLowerCase();
-  } catch {
-    return null; // data:, blob:, about: — treated as first-party (inline)
-  }
-}
-
-/** Registrable domain (eTLD+1), best-effort. IPs and bare hosts pass through. */
-function registrableDomain(host: string): string {
-  if (host.includes(":")) return host; // IPv6
-  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return host; // IPv4
-  const parts = host.split(".");
-  if (parts.length <= 2) return host;
-  const last2 = parts.slice(-2).join(".");
-  return MULTI_PART_SUFFIXES.has(last2) ? parts.slice(-3).join(".") : last2;
-}
-
-function isThirdParty(reqUrl: string, firstPartyDomain: string): boolean {
-  const h = hostOf(reqUrl);
-  if (!h || !firstPartyDomain) return false;
-  return registrableDomain(h) !== firstPartyDomain;
-}
-
-/** Aggregate the third-party slice of a set of network records. */
-function buildThirdParty(
-  records: Array<{ url: string; encodedKB: number; interval?: [number, number] }>,
-  firstPartyDomain: string,
-): ThirdPartyBreakdown {
-  const byDomain = new Map<
-    string,
-    { requestCount: number; encodedKB: number; intervals: Array<[number, number]> }
-  >();
-  const allIntervals: Array<[number, number]> = [];
-  let requestCount = 0;
-  let encodedKB = 0;
-  for (const r of records) {
-    if (!isThirdParty(r.url, firstPartyDomain)) continue;
-    const host = hostOf(r.url);
-    if (!host) continue;
-    const domain = registrableDomain(host);
-    const bucket =
-      byDomain.get(domain) ??
-      byDomain.set(domain, { requestCount: 0, encodedKB: 0, intervals: [] }).get(domain)!;
-    bucket.requestCount += 1;
-    bucket.encodedKB += r.encodedKB;
-    requestCount += 1;
-    encodedKB += r.encodedKB;
-    if (r.interval) {
-      bucket.intervals.push(r.interval);
-      allIntervals.push(r.interval);
-    }
-  }
-  return {
-    requestCount,
-    encodedKB: round(encodedKB),
-    busyMs: round(unionLength(allIntervals)),
-    byDomain: [...byDomain.entries()]
-      .map(([domain, v]) => ({
-        domain,
-        requestCount: v.requestCount,
-        encodedKB: round(v.encodedKB),
-        busyMs: round(unionLength(v.intervals)),
-      }))
-      .sort((a, b) => b.encodedKB - a.encodedKB),
-  };
-}
-
-/** Aggregate requests by their initiator frame (top issuers first, by count). */
-function buildInitiators(
-  records: Array<{ initiator?: Initiator; encodedKB: number }>,
-): InitiatorStat[] {
-  const by = new Map<string, InitiatorStat>();
-  for (const r of records) {
-    if (!r.initiator) continue;
-    const frame = r.initiator.frame ?? `(${r.initiator.type})`;
-    const bucket =
-      by.get(frame) ??
-      by.set(frame, { frame, type: r.initiator.type, requestCount: 0, encodedKB: 0 }).get(frame)!;
-    bucket.requestCount += 1;
-    bucket.encodedKB += r.encodedKB;
-  }
-  return [...by.values()]
-    .map((s) => ({ ...s, encodedKB: round(s.encodedKB) }))
-    .sort((a, b) => b.requestCount - a.requestCount || b.encodedKB - a.encodedKB)
-    .slice(0, 8);
-}
-
-/** Length of the union of intervals. Used for network busy time. */
-function unionLength(intervals: Array<[number, number]>): number {
-  if (intervals.length === 0) return 0;
-  const sorted = [...intervals].sort((a, b) => a[0] - b[0]);
-  let total = 0;
-  let [curStart, curEnd] = sorted[0];
-  for (let i = 1; i < sorted.length; i++) {
-    const [s, e] = sorted[i];
-    if (s > curEnd) {
-      total += curEnd - curStart;
-      curStart = s;
-      curEnd = e;
-    } else if (e > curEnd) {
-      curEnd = e;
-    }
-  }
-  total += curEnd - curStart;
-  return total;
-}
-
-function pickAttribution(
-  name: string,
-  attr: Record<string, unknown> | undefined,
-): Record<string, unknown> {
-  if (!attr) return {};
-  const keys: Record<string, string[]> = {
-    LCP: [
-      "element",
-      "url",
-      "timeToFirstByte",
-      "resourceLoadDelay",
-      "resourceLoadDuration",
-      "elementRenderDelay",
-    ],
-    INP: [
-      "interactionTarget",
-      "interactionType",
-      "inputDelay",
-      "processingDuration",
-      "presentationDelay",
-    ],
-    CLS: ["largestShiftTarget", "largestShiftValue"],
-  };
-  const wanted = keys[name];
-  if (!wanted) return {};
-  const out: Record<string, unknown> = {};
-  for (const k of wanted) {
-    if (attr[k] !== undefined) out[k] = attr[k];
-  }
-  return out;
-}
-
-function buildGlobalNetwork(
-  reqs: NetReq[],
-  firstPartyDomain: string,
-): NetworkReport {
-  const byType: NetworkReport["byType"] = {};
-  let totalEncoded = 0;
-  const finished: NetworkReport["slowest"] = [];
-  const tpRecords: Array<{
-    url: string;
-    encodedKB: number;
-    interval?: [number, number];
-    initiator?: Initiator;
-  }> = [];
-  for (const r of reqs) {
-    const encoded = r.encoded ?? 0;
-    totalEncoded += encoded;
-    const bucket = (byType[r.type] ??= { count: 0, encodedKB: 0 });
-    bucket.count += 1;
-    bucket.encodedKB += encoded / 1024;
-    if (r.endEpochMs != null) {
-      finished.push({
-        url: r.url,
-        type: r.type,
-        durationMs: round(r.endEpochMs - r.startEpochMs),
-        kb: round(encoded / 1024),
-      });
-    }
-    tpRecords.push({
-      url: r.url,
-      encodedKB: encoded / 1024,
-      interval:
-        r.endEpochMs != null ? [r.startEpochMs, r.endEpochMs] : undefined,
-      initiator: r.initiator,
-    });
-  }
-  for (const b of Object.values(byType)) b.encodedKB = round(b.encodedKB);
-  finished.sort((a, b) => b.durationMs - a.durationMs);
-  return {
-    totalRequests: reqs.length,
-    totalEncodedKB: round(totalEncoded / 1024),
-    byType,
-    slowest: finished.slice(0, 8),
-    thirdParty: buildThirdParty(tpRecords, firstPartyDomain),
-    byInitiator: buildInitiators(tpRecords),
-    fromCacheCount: reqs.filter((r) => r.fromCache).length,
-  };
-}
-
-interface EpochWindow {
-  startEpochMs: number;
-  endEpochMs: number;
-}
-
-function buildSpanNetwork(
-  span: EpochWindow,
-  reqs: NetReq[],
-  firstPartyDomain: string,
-): SpanNetwork {
-  const intervals: Array<[number, number]> = [];
-  const requests: SpanNetwork["requests"] = [];
-  const tpRecords: Array<{
-    url: string;
-    encodedKB: number;
-    interval?: [number, number];
-    initiator?: Initiator;
-  }> = [];
-  let encoded = 0;
-  for (const r of reqs) {
-    const end = r.endEpochMs ?? r.startEpochMs;
-    if (r.startEpochMs > span.endEpochMs || end < span.startEpochMs) continue;
-    encoded += r.encoded ?? 0;
-    const clipStart = Math.max(r.startEpochMs, span.startEpochMs);
-    const clipEnd = Math.min(end, span.endEpochMs);
-    const interval: [number, number] | undefined =
-      clipEnd > clipStart ? [clipStart, clipEnd] : undefined;
-    if (interval) intervals.push(interval);
-    const tp = isThirdParty(r.url, firstPartyDomain);
-    requests.push({
-      url: r.url,
-      type: r.type,
-      startOffsetMs: round(r.startEpochMs - span.startEpochMs),
-      durationMs: round(end - r.startEpochMs),
-      kb: round((r.encoded ?? 0) / 1024),
-      thirdParty: tp,
-      initiator: r.initiator,
-    });
-    tpRecords.push({
-      url: r.url,
-      encodedKB: (r.encoded ?? 0) / 1024,
-      interval,
-      initiator: r.initiator,
-    });
-  }
-  requests.sort((a, b) => b.durationMs - a.durationMs);
-  // Cap the per-request detail list: a span on a request-heavy page can hold
-  // hundreds of entries and bloat every report. Counts/bytes/busy/thirdParty
-  // above are computed over all requests; only the (slowest-first) detail is cut.
-  const requestCount = requests.length;
-  return {
-    requestCount,
-    encodedKB: round(encoded / 1024),
-    busyMs: round(unionLength(intervals)),
-    waves: countWaves(intervals),
-    thirdParty: buildThirdParty(tpRecords, firstPartyDomain),
-    byInitiator: buildInitiators(tpRecords),
-    requests: requests.slice(0, REQUESTS_PER_SPAN_LIMIT),
-  };
-}
-
-/**
- * Number of waterfall waves = approximate serial dependency depth. Scans request
- * intervals in start order; a request that starts after the running wave's max
- * end time begins a new wave. 1 = fully parallel, higher = deeper fetch chains.
- */
-function countWaves(intervals: Array<[number, number]>): number {
-  if (intervals.length === 0) return 0;
-  const sorted = [...intervals].sort((a, b) => a[0] - b[0]);
-  let waves = 1;
-  let waveEnd = sorted[0][1];
-  for (let i = 1; i < sorted.length; i++) {
-    const [s, e] = sorted[i];
-    if (s > waveEnd) {
-      waves += 1;
-      waveEnd = e;
-    } else {
-      waveEnd = Math.max(waveEnd, e);
-    }
-  }
-  return waves;
-}
-
-interface TraceEvent {
-  name?: string;
-  ph?: string;
-  ts?: number;
-  dur?: number;
-}
-
-/**
- * Aggregate Paint count/time and GPU task time within a span window (monotonic μs).
- * The span window comes from getMetrics Timestamp, the same clock as trace ts, so
- * no conversion is needed.
- */
-function buildTraceRender(
-  events: TraceEvent[],
-  startUs: number,
-  endUs: number,
-): Pick<SpanRender, "paintCount" | "paintMs" | "gpuMs"> {
-  let paintCount = 0;
-  let paintMs = 0;
-  let gpuMs = 0;
-  for (const e of events) {
-    if (e.ph !== "X" || e.ts == null || e.dur == null) continue;
-    if (e.ts < startUs || e.ts > endUs) continue;
-    if (e.name === "Paint") {
-      paintCount += 1;
-      paintMs += e.dur / 1000;
-    } else if (e.name === "GPUTask") {
-      gpuMs += e.dur / 1000;
-    }
-  }
-  return { paintCount, paintMs: round(paintMs), gpuMs: round(gpuMs) };
-}
-
-function buildSpanCpu(
-  span: EpochWindow,
-  longTasks: Array<{ epochStart: number; duration: number }>,
-  loaf: Array<{ epochStart: number; duration: number; blocking: number }>,
-): SpanCpu {
-  const inWindow = (epochStart: number) =>
-    epochStart >= span.startEpochMs && epochStart <= span.endEpochMs;
-  const lt = longTasks.filter((t) => inWindow(t.epochStart));
-  const lf = loaf.filter((l) => inWindow(l.epochStart));
-  return {
-    longTaskCount: lt.length,
-    blockingMs: round(lt.reduce((a, t) => a + t.duration, 0)),
-    maxLongTaskMs: round(lt.reduce((a, t) => Math.max(a, t.duration), 0)),
-    loafCount: lf.length,
-    maxLoafBlockingMs: round(lf.reduce((a, l) => Math.max(a, l.blocking), 0)),
-  };
-}
-
-/** Memory gauges tracked for cross-step growth; floor = min growth to call a leak. */
-const TREND_METRICS: Array<{
-  key: string;
-  get: (m: SpanMemory) => number;
-  floor: number;
-}> = [
-  { key: "jsHeapUsedMB", get: (m) => m.jsHeapUsedMB, floor: 2 },
-  { key: "jsEventListeners", get: (m) => m.jsEventListeners, floor: 10 },
-  { key: "domNodes", get: (m) => m.domNodes, floor: 50 },
-  { key: "arrayBuffers", get: (m) => m.arrayBuffers, floor: 5 },
-];
-
-const repeatIndex = (name: string): number => {
-  const m = /#(\d+)$/.exec(name);
-  return m ? Number(m[1]) : -1;
-};
-
-/**
- * Detect monotonic memory growth across the `${name}#${i}` spans of a measureRepeat.
- * A metric is reported only when it grows past its floor; `leak` is set when that
- * growth is also monotonic (the value didn't meaningfully drop between repeats).
- */
-function buildTrends(spans: SpanReport[]): MemoryTrend[] {
-  const groups = new Map<string, SpanReport[]>();
-  for (const s of spans) {
-    const m = /^(.*)#(\d+)$/.exec(s.name);
-    if (!m) continue;
-    const prefix = m[1];
-    (groups.get(prefix) ?? groups.set(prefix, []).get(prefix)!).push(s);
-  }
-  const trends: MemoryTrend[] = [];
-  for (const [prefix, group] of groups) {
-    if (group.length < 3) continue; // too few points to call a trend
-    group.sort((a, b) => repeatIndex(a.name) - repeatIndex(b.name));
-    for (const tm of TREND_METRICS) {
-      const values = group.map((s) => round(tm.get(s.memory)));
-      const growth = round(values[values.length - 1] - values[0]);
-      // Worst single backslide. A real leak ramps up with only minor dips; a
-      // value that bounces (e.g. maplibre's tile buffers, reclaimed by GC between
-      // steps) has a backslide comparable to or larger than its net growth, even
-      // when the endpoints happen to be higher. Require the net climb to dominate
-      // the jitter — otherwise the +N is noise, not retention.
-      let maxDrop = 0;
-      let maxStepInc = 0;
-      let incCount = 0;
-      for (let i = 1; i < values.length; i++) {
-        const delta = values[i] - values[i - 1];
-        if (delta > 0) {
-          incCount += 1;
-          if (delta > maxStepInc) maxStepInc = delta;
-        } else if (-delta > maxDrop) {
-          maxDrop = -delta;
-        }
-      }
-      const monotonic = maxDrop <= 0.1 * Math.abs(growth);
-      // A leak grows step over step. Three things must hold:
-      // - the net climb dominates the worst backslide (not a bouncing series, e.g.
-      //   maplibre tile buffers reclaimed by GC),
-      // - the growth is a meaningful fraction of the baseline, not just past an
-      //   absolute floor (a +8 churn on a 1500 baseline isn't a leak; 30→180 is),
-      // - the growth is DISTRIBUTED across steps, not one jump (a single tile batch
-      //   loaded on the last pan, 44→44→44→44→125, is a one-off, not retention).
-      const rel = values[0] > 0 ? growth / values[0] : Infinity;
-      // and the back half must keep growing — a series that ramps then plateaus
-      // (maplibre warming its tile cache: 11→21→27→27.6) is allocation that
-      // levels off, not an unbounded leak.
-      const mid = Math.floor(values.length / 2);
-      const secondHalfGrowth = values[values.length - 1] - values[mid];
-      const distributed =
-        maxStepInc <= 0.6 * growth &&
-        incCount >= Math.ceil((values.length - 1) / 2) &&
-        secondHalfGrowth >= 0.25 * growth;
-      const leak =
-        growth >= tm.floor && growth > 2 * maxDrop && rel >= 0.2 && distributed;
-      if (!leak) continue; // only surface sustained, distributed, non-plateauing ramps
-      trends.push({
-        name: prefix,
-        count: group.length,
-        metric: tm.key,
-        values,
-        growth,
-        perStep: round(growth / (group.length - 1)),
-        monotonic,
-        leak,
-      });
-    }
-  }
-  return trends;
-}
-
-// --- coverage (PERF_COV) -------------------------------------------------
-// Playwright Chromium coverage entry shapes (only the fields we read).
-interface JSCoverageEntry {
-  url: string;
-  source?: string;
-  functions: Array<{
-    ranges: Array<{ startOffset: number; endOffset: number; count: number }>;
-  }>;
-}
-interface CSSCoverageEntry {
-  url: string;
-  text?: string;
-  ranges: Array<{ start: number; end: number }>;
-}
-
-/** Per-resource used byte ranges (merged), kept for cross-scenario union. */
-interface CoverageArtifact {
-  js: Array<{ url: string; total: number; used: Array<[number, number]> }>;
-  css: Array<{ url: string; total: number; used: Array<[number, number]> }>;
-}
-
-/** Merge overlapping/adjacent byte ranges into a minimal sorted set. */
-function mergeRanges(ranges: Array<[number, number]>): Array<[number, number]> {
-  if (ranges.length === 0) return [];
-  const sorted = [...ranges].sort((a, b) => a[0] - b[0]);
-  const out: Array<[number, number]> = [[sorted[0][0], sorted[0][1]]];
-  for (let i = 1; i < sorted.length; i++) {
-    const [s, e] = sorted[i];
-    const last = out[out.length - 1];
-    if (s <= last[1]) last[1] = Math.max(last[1], e);
-    else out.push([s, e]);
-  }
-  return out;
-}
-
-const rangesLen = (r: Array<[number, number]>): number =>
-  r.reduce((a, [s, e]) => a + (e - s), 0);
-
-/**
- * V8 block coverage → used byte ranges. Ranges are nested: a byte's coverage is
- * the count of the INNERMOST range containing it (the outermost range is the whole
- * module and is count>0 whenever it merely evaluated, so a naive union of count>0
- * ranges reports ~100%). Paint outer→inner (inner overrides) and extract the runs
- * that ended up covered.
- */
-function jsUsedRanges(
-  functions: JSCoverageEntry["functions"],
-  total: number,
-): Array<[number, number]> {
-  if (!total) return [];
-  const ranges: Array<{ startOffset: number; endOffset: number; count: number }> = [];
-  for (const fn of functions) for (const r of fn.ranges) ranges.push(r);
-  // outer first: smaller start, then larger end; inner ranges come later and override
-  ranges.sort((a, b) => a.startOffset - b.startOffset || b.endOffset - a.endOffset);
-  const paint = new Uint8Array(total);
-  for (const r of ranges) {
-    paint.fill(r.count > 0 ? 1 : 0, r.startOffset, Math.min(r.endOffset, total));
-  }
-  const out: Array<[number, number]> = [];
-  let start = -1;
-  for (let i = 0; i < total; i++) {
-    if (paint[i] === 1) {
-      if (start < 0) start = i;
-    } else if (start >= 0) {
-      out.push([start, i]);
-      start = -1;
-    }
-  }
-  if (start >= 0) out.push([start, total]);
-  return out;
-}
-
-/** Group by url, merge used ranges; total = source/text length (or max offset). */
-function collectCoverage(
-  items: Array<{ url: string; total: number; used: Array<[number, number]> }>,
-): Array<{ url: string; total: number; used: Array<[number, number]> }> {
-  const by = new Map<
-    string,
-    { total: number; used: Array<[number, number]> }
-  >();
-  for (const it of items) {
-    if (!it.url) continue; // skip inline/anonymous
-    const b = by.get(it.url) ?? { total: 0, used: [] };
-    b.total = Math.max(b.total, it.total);
-    b.used.push(...it.used);
-    by.set(it.url, b);
-  }
-  return [...by.entries()].map(([url, b]) => ({
-    url,
-    total: b.total,
-    used: mergeRanges(b.used),
-  }));
-}
-
-function toCoverageReport(
-  perUrl: Array<{ url: string; total: number; used: Array<[number, number]> }>,
-): CoverageReport {
-  let totalBytes = 0;
-  let usedBytes = 0;
-  const files = perUrl.map((f) => {
-    const used = rangesLen(f.used);
-    totalBytes += f.total;
-    usedBytes += used;
-    return {
-      url: f.url,
-      totalBytes: f.total,
-      usedBytes: used,
-      usedPct: f.total > 0 ? Math.round((used / f.total) * 1000) / 10 : 0,
-    };
-  });
-  // heaviest unused first — the best split/drop candidates
-  files.sort((a, b) => b.totalBytes - b.usedBytes - (a.totalBytes - a.usedBytes));
-  return {
-    totalBytes,
-    usedBytes,
-    usedPct: totalBytes > 0 ? Math.round((usedBytes / totalBytes) * 1000) / 10 : 0,
-    files: files.slice(0, 40),
-  };
-}
-
-/** Build the scenario coverage report + the range artifact (for cross-scenario union). */
-function buildCoverage(
-  js: JSCoverageEntry[],
-  css: CSSCoverageEntry[],
-): { coverage: Coverage; artifact: CoverageArtifact } {
-  const jsItems = js.map((e) => {
-    let maxEnd = 0;
-    for (const fn of e.functions)
-      for (const r of fn.ranges) if (r.endOffset > maxEnd) maxEnd = r.endOffset;
-    const total = e.source?.length ?? maxEnd;
-    return { url: e.url, total, used: jsUsedRanges(e.functions, total) };
-  });
-  const cssItems = css.map((e) => ({
-    url: e.url,
-    total: e.text?.length ?? 0,
-    used: e.ranges.map((r) => [r.start, r.end] as [number, number]),
-  }));
-  const jsPerUrl = collectCoverage(jsItems);
-  const cssPerUrl = collectCoverage(cssItems);
-  return {
-    coverage: { js: toCoverageReport(jsPerUrl), css: toCoverageReport(cssPerUrl) },
-    artifact: { js: jsPerUrl, css: cssPerUrl },
-  };
-}
-
-interface EpochEvent {
-  epochStart: number;
-  duration: number;
-  type: string;
-  start: number;
-  processingStart: number;
-  processingEnd: number;
-}
-
-/** Worst interaction in the span window, split into the three INP phases. */
-function buildSpanInteraction(
-  span: EpochWindow,
-  events: EpochEvent[],
-): SpanInteraction | undefined {
-  const inWindow = events.filter(
-    (e) => e.epochStart >= span.startEpochMs && e.epochStart <= span.endEpochMs,
-  );
-  if (inWindow.length === 0) return undefined;
-  let worst = inWindow[0];
-  for (const e of inWindow) if (e.duration > worst.duration) worst = e;
-  return {
-    count: inWindow.length,
-    maxDurationMs: round(worst.duration),
-    type: worst.type,
-    inputDelayMs: round(worst.processingStart - worst.start),
-    processingMs: round(worst.processingEnd - worst.processingStart),
-    presentationMs: round(worst.start + worst.duration - worst.processingEnd),
-  };
-}
-
-/** Frame cadence inside the span window (16.7ms = one 60Hz frame). */
-function buildSpanFrames(
-  span: EpochWindow,
-  frameEpochs: number[],
-): SpanFrames | undefined {
-  const inWindow = frameEpochs
-    .filter((t) => t >= span.startEpochMs && t <= span.endEpochMs)
-    .sort((a, b) => a - b);
-  if (inWindow.length < 2) return undefined;
-  let dropped = 0;
-  let longest = 0;
-  for (let i = 1; i < inWindow.length; i++) {
-    const dt = inWindow[i] - inWindow[i - 1];
-    if (dt > longest) longest = dt;
-    const missed = Math.round(dt / 16.67) - 1;
-    if (missed > 0) dropped += missed;
-  }
-  const seconds = (inWindow[inWindow.length - 1] - inWindow[0]) / 1000;
-  return {
-    count: inWindow.length,
-    droppedFrames: dropped,
-    longestFrameMs: round(longest),
-    fps: seconds > 0 ? round((inWindow.length - 1) / seconds) : 0,
-  };
-}
 
 function buildReport(
   title: string,
@@ -2058,10 +1149,6 @@ export function logSummary(report: PerfReport, memGc: boolean = MEM_GC): void {
   // eslint-disable-next-line no-console
   console.log(lines.join("\n"));
 }
-
-// ---------------------------------------------------------------------------
-// fixture
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Reusable measurement session. Works with any Playwright Page + CDPSession, so
