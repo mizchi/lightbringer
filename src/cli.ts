@@ -248,7 +248,10 @@ function runSpecMode() {
   const hookPath = fileURLToPath(new URL("../scripts/pw-hook.mjs", import.meta.url));
   const env: NodeJS.ProcessEnv = {
     ...process.env,
-    LIGHTBRINGER_AUTO_WRAP: new URL("./auto.js", import.meta.url).href,
+    // Point at autowrap.js (type-only on @playwright/test), NOT auto.js (which
+    // value-imports it) — else the loader pulls a 2nd Playwright instance next to
+    // the project's and Playwright aborts ("required from two locations").
+    LIGHTBRINGER_AUTO_WRAP: new URL("./autowrap.js", import.meta.url).href,
     PERF_OUT_DIR: outDir,
     NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import ${hookPath}`.trim(),
   };
