@@ -503,7 +503,81 @@ The bench specs here default to their *slow* path (to demonstrate each metric), 
 the template passes `BENCH_FIXED=1` to run the optimized path and stay green —
 your own specs won't need that.
 
-## `lightbringer/analyze` (framework-agnostic analysis)
+## API
+
+Four ways to use it, then the full surface for each. The sections above are the
+tutorial; this is the lookup.
+
+### Entry points
+
+| import / command | what you get |
+| --- | --- |
+| `import { test, expect } from "lightbringer"` | extended Playwright fixture exposing **`perf`** (below) — you mark spans with `perf.measure`. Also re-exports `withSpan` / `startSpan`, `PerfController`, `startSession`, `logSummary`, `toOtelSpans`, and the report types. |
+| `import { test, expect } from "lightbringer/auto"` | same `test`, but every `page.goto` / Locator action becomes a span automatically — no `perf.measure` calls (see [Auto-span](#auto-span-measure-an-existing-spec-1-line-change)). |
+| `import { … } from "lightbringer/analyze"` | the pure CDP-event analysis layer — builder functions + fragment types, **no Playwright / fs dependency** (below). |
+| `npx lightbringer run <scenario.json \| spec.ts \| dir>` | the zero-install CLI (see [CLI](#cli-no-install-no-spec)). |
+
+### `perf` — the measurement controller (fixture)
+
+| method | what it does |
+| --- | --- |
+| `perf.measure(name, action, opts?)` | record one span covering `action` until the page settles; returns the action's result. `opts: { settle?: Settle; budget?: Budget }`. |
+| `perf.measureRepeat(name, action, opts?)` | repeat `action` N times as `name#0..#N` for the leak trend. `opts: { times? = 3; settle?; budget? }`. |
+| `perf.setVitalsBudget(budget)` | page-global web-vitals bounds: `{ LCP?; INP?; CLS?; TTFB?; FCP? }`. |
+
+`Settle = (page) => Promise<void>` (default: two animation frames; capped by
+`PERF_SETTLE_TIMEOUT`). `Budget` fields are listed under [Budgets](#budgets-ci-regression-gate).
+
+### App-code spans
+
+`withSpan(name, fn, attrs?)` wraps a region of **your app** code (emits a
+`performance.measure`, collected and nested by time containment).
+`startSpan(name) → { end() }` is the manual start/stop form.
+
+### CLI
+
+`lightbringer run <scenario.json | spec.ts | dir> [flags]` — a `.json` file runs
+the scenario DSL; anything else runs through `playwright test` with your config.
+
+| flag | effect |
+| --- | --- |
+| `--repeat N` | run N times (→ `--repeat-each=N` in spec mode) |
+| `--out DIR` | report output dir (default `perf-results`) |
+| `--config FILE` | Playwright config to reuse (spec mode) |
+| `--emit-budgets` | write `lightbringer.budgets.json` from the medians (×1.25 headroom) |
+| `--gate` | fail if a median exceeds the emitted budget |
+| `--gpu` | hardware GL (real GPU / paint numbers) |
+| `--cpu N` | throttle CPU N× |
+| `--net slow-3g\|fast-3g\|4g` | network emulation |
+| `--mem` / `--cov` / `--css` / `--trace` | enable the matching `PERF_*` analysis |
+| `--headed` | show the browser |
+
+### Env flags (test-fixture mode)
+
+| var | effect |
+| --- | --- |
+| `PERF_TRACE=1` | save a Chrome trace; fills Paint/GPU and enables the drilldown |
+| `PERF_GPU=1` | hardware GL (otherwise SwiftShader → fake GPU numbers) |
+| `PERF_CPU=N` | throttle the CPU N× |
+| `PERF_NET=slow-3g\|fast-3g\|4g` | network emulation |
+| `PERF_MEM=1` | force GC at span boundaries (retained-only memory deltas) |
+| `PERF_CSS=1` | per-selector SelectorStats in the trace (implies a trace) |
+| `PERF_COV=1` | record JS + CSS coverage across the scenario |
+| `PERF_ASSERT=1` | inline budget gate — fail the test in teardown on a single run |
+| `PERF_OUT_DIR=DIR` | report output dir (default `perf-results`) |
+| `PERF_SETTLE_TIMEOUT=MS` | settle cap before a span is flagged `capped` (default 5000) |
+| `PERF_PORT=N` | fixture dev-server port (default 5173) |
+
+### Scripts (also installed as bins)
+
+| bin (`scripts/*.mjs`) | purpose |
+| --- | --- |
+| `lightbringer-median` | median (p25..p75) across runs; **exits 1** on a budget violation |
+| `lightbringer-regress` | baseline-vs-current diff; exits 1 on a regression past the threshold |
+| `lightbringer-drilldown` | trace breakdown for one span (needs `PERF_TRACE=1`) |
+| `lightbringer-coverage` | union coverage across the suite (dead-code / over-shipping) |
+
+### `lightbringer/analyze` (framework-agnostic analysis)
 
 The part that turns raw CDP / Performance events into a report is a pure layer
 with no Playwright, network, or filesystem dependency. It's published as a
