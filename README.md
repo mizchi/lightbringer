@@ -12,6 +12,9 @@ not how the test waits.
 Lighthouse only measures the initial load; lightbringer covers the whole scenario
 lifecycle, step by step.
 
+> New here? The [reading guide](docs/guide.md) walks through measuring a scenario
+> and reading a real, annotated report line by line.
+
 **In scope:** per-step network / CPU / render / INP / memory load of one scenario,
 a median gate for regressions, and a trace drilldown to the responsible code.
 **Out of scope (non-goals):** a general always-on profiler, cross-scenario / whole-
