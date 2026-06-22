@@ -109,6 +109,14 @@ scenario (load a heavy page, then scroll) measured on a laptop:
   ! software GL (SwiftShader): GPU / render numbers are NOT real hardware. Use PERF_GPU=1.
 ```
 
+In a real terminal this is **colour-coded by importance** (stripped here because
+the page is plain text): metric labels are dimmed so the values stand out, web-vital
+ratings are green / yellow / red, notable costs (a slow step, jank, over-fetch, a
+`capped` span) are yellow, and genuine problems (a broken budget, a likely leak, an
+invalid run) are red. Routine zero-cost lines are dimmed — present for completeness,
+not for your attention. Colour follows `NO_COLOR` / `PERF_COLOR=0|1` and turns off
+automatically when the output isn't a terminal (CI logs, `> file`).
+
 ### Line by line
 
 **Page-global header** (measured once for the whole page):
