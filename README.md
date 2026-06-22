@@ -572,6 +572,7 @@ the scenario DSL; anything else runs through `playwright test` with your config.
 | `PERF_OUT_DIR=DIR` | report output dir (default `perf-results`) |
 | `PERF_SETTLE_TIMEOUT=MS` | settle cap before a span is flagged `capped` (default 5000) |
 | `PERF_PORT=N` | fixture dev-server port (default 5173) |
+| `PERF_COLOR=0\|1` | force summary colour off / on (default: on when stdout is a TTY; also honours `NO_COLOR`) |
 
 ### Scripts (also installed as bins)
 

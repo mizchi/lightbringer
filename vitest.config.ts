@@ -6,7 +6,7 @@ export default defineConfig({
   // pure; collector.ts pulls in Playwright/web-vitals at module load, so it is
   // kept out of the vitest runner.
   test: {
-    includeSource: ["src/otel.ts", "src/trace.ts", "src/analyze/*.ts"],
+    includeSource: ["src/otel.ts", "src/trace.ts", "src/color.ts", "src/analyze/*.ts"],
     // examples/*.spec.ts are Playwright tests; keep the vitest runner out of them.
     // .direnv holds a Nix-materialized copy of the repo (incl. examples) — exclude it too.
     exclude: ["**/node_modules/**", "**/dist/**", "**/.direnv/**", "examples/**"],
