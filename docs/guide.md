@@ -15,6 +15,8 @@ change how the test waits.
 
 There are three entry points. They all produce the same report and obey the same
 `PERF_*` flags — pick the one that fits how much you want to touch your tests.
+(Prefer to learn by running? The [sample project](../examples/sample-project/) is a
+self-contained app wired up all three ways.)
 
 ### A. Fixture with explicit spans (recommended)
 

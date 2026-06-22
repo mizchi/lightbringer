@@ -13,7 +13,9 @@ Lighthouse only measures the initial load; lightbringer covers the whole scenari
 lifecycle, step by step.
 
 > New here? The [reading guide](docs/guide.md) walks through measuring a scenario
-> and reading a real, annotated report line by line.
+> and reading a real, annotated report line by line — or jump straight to the
+> runnable [sample project](examples/sample-project/) (`pnpm exec playwright test
+> --config examples/sample-project/playwright.config.ts`).
 
 **In scope:** per-step network / CPU / render / INP / memory load of one scenario,
 a median gate for regressions, and a trace drilldown to the responsible code.
